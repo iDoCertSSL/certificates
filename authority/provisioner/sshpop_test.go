@@ -5,17 +5,19 @@ import (
 	"crypto"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/db"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/jose"
 	"golang.org/x/crypto/ssh"
+
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+
+	"github.com/smallstep/assert"
+	"github.com/smallstep/certificates/api/render"
 )
 
 func TestSSHPOP_Getters(t *testing.T) {
@@ -39,6 +41,7 @@ func TestSSHPOP_Getters(t *testing.T) {
 }
 
 func createSSHCert(cert *ssh.Certificate, signer ssh.Signer) (*ssh.Certificate, *jose.JSONWebKey, error) {
+	now := time.Now()
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "foo", 0)
 	if err != nil {
 		return nil, nil, err
@@ -47,7 +50,13 @@ func createSSHCert(cert *ssh.Certificate, signer ssh.Signer) (*ssh.Certificate, 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = cert.SignCert(rand.Reader, signer); err != nil {
+	if cert.ValidAfter == 0 {
+		cert.ValidAfter = uint64(now.Unix())
+	}
+	if cert.ValidBefore == 0 {
+		cert.ValidBefore = uint64(now.Add(time.Hour).Unix())
+	}
+	if err := cert.SignCert(rand.Reader, signer); err != nil {
 		return nil, nil, err
 	}
 	return cert, jwk, nil
@@ -83,52 +92,9 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 				err:   errors.New("sshpop.authorizeToken; error extracting sshpop header from token: extractSSHPOPCert; error parsing token: "),
 			}
 		},
-		"fail/error-revoked-db-check": func(t *testing.T) test {
-			p, err := generateSSHPOP()
-			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, errors.New("force")
-				},
-			}
-			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
-			assert.FatalError(t, err)
-			tok, err := generateSSHPOPToken(p, cert, jwk)
-			assert.FatalError(t, err)
-			return test{
-				p:     p,
-				token: tok,
-				code:  http.StatusInternalServerError,
-				err:   errors.New("sshpop.authorizeToken; error checking checking sshpop cert revocation: force"),
-			}
-		},
-		"fail/cert-already-revoked": func(t *testing.T) test {
-			p, err := generateSSHPOP()
-			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return true, nil
-				},
-			}
-			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
-			assert.FatalError(t, err)
-			tok, err := generateSSHPOPToken(p, cert, jwk)
-			assert.FatalError(t, err)
-			return test{
-				p:     p,
-				token: tok,
-				code:  http.StatusUnauthorized,
-				err:   errors.New("sshpop.authorizeToken; sshpop certificate is revoked"),
-			}
-		},
 		"fail/cert-not-yet-valid": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{
 				CertType:   ssh.UserCert,
 				ValidAfter: uint64(time.Now().Add(time.Minute).Unix()),
@@ -146,11 +112,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/cert-past-validity": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{
 				CertType:    ssh.UserCert,
 				ValidBefore: uint64(time.Now().Add(-time.Minute).Unix()),
@@ -168,11 +129,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/no-signer-found": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.HostCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateSSHPOPToken(p, cert, jwk)
@@ -187,11 +143,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/error-parsing-claims-bad-sig": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, _, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			otherJWK, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
@@ -208,11 +159,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/invalid-claims-issuer": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("foo", "bar", testAudiences.Sign[0], "",
@@ -228,11 +174,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/invalid-audience": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("foo", p.GetName(), "invalid-aud", "",
@@ -248,11 +189,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"fail/empty-subject": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("", p.GetName(), testAudiences.Sign[0], "",
@@ -268,11 +204,6 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 		"ok": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateSSHPOPToken(p, cert, jwk)
@@ -286,17 +217,16 @@ func TestSSHPOP_authorizeToken(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
-			if claims, err := tc.p.authorizeToken(tc.token, testAudiences.Sign); err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tc.code)
+			if claims, err := tc.p.authorizeToken(tc.token, testAudiences.Sign, true); err != nil {
+				var sc render.StatusCodedError
+				if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+					assert.Equals(t, sc.StatusCode(), tc.code)
+				}
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
-			} else {
-				if assert.Nil(t, tc.err) {
-					assert.NotNil(t, claims)
-				}
+			} else if assert.Nil(t, tc.err) {
+				assert.NotNil(t, claims)
 			}
 		})
 	}
@@ -330,11 +260,6 @@ func TestSSHPOP_AuthorizeSSHRevoke(t *testing.T) {
 		"fail/subject-not-equal-serial": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("foo", p.GetName(), testAudiences.SSHRevoke[0], "",
@@ -344,17 +269,12 @@ func TestSSHPOP_AuthorizeSSHRevoke(t *testing.T) {
 				p:     p,
 				token: tok,
 				code:  http.StatusBadRequest,
-				err:   errors.New("sshpop.AuthorizeSSHRevoke; sshpop token subject must be equivalent to sshpop certificate serial number"),
+				err:   errors.New("sshpop token subject must be equivalent to sshpop certificate serial number"),
 			}
 		},
 		"ok": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{Serial: 123455, CertType: ssh.UserCert}, sshSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("123455", p.GetName(), testAudiences.SSHRevoke[0], "",
@@ -370,9 +290,10 @@ func TestSSHPOP_AuthorizeSSHRevoke(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
 			if err := tc.p.AuthorizeSSHRevoke(context.Background(), tc.token); err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tc.code)
+				var sc render.StatusCodedError
+				if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+					assert.Equals(t, sc.StatusCode(), tc.code)
+				}
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -419,11 +340,6 @@ func TestSSHPOP_AuthorizeSSHRenew(t *testing.T) {
 		"fail/not-host-cert": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshUserSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("foo", p.GetName(), testAudiences.SSHRenew[0], "",
@@ -433,17 +349,12 @@ func TestSSHPOP_AuthorizeSSHRenew(t *testing.T) {
 				p:     p,
 				token: tok,
 				code:  http.StatusBadRequest,
-				err:   errors.New("sshpop.AuthorizeSSHRenew; sshpop certificate must be a host ssh certificate"),
+				err:   errors.New("sshpop certificate must be a host ssh certificate"),
 			}
 		},
 		"ok": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{Serial: 123455, CertType: ssh.HostCert}, sshHostSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("123455", p.GetName(), testAudiences.SSHRenew[0], "",
@@ -461,9 +372,10 @@ func TestSSHPOP_AuthorizeSSHRenew(t *testing.T) {
 			tc := tt(t)
 			if cert, err := tc.p.AuthorizeSSHRenew(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
@@ -511,11 +423,6 @@ func TestSSHPOP_AuthorizeSSHRekey(t *testing.T) {
 		"fail/not-host-cert": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{CertType: ssh.UserCert}, sshUserSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("foo", p.GetName(), testAudiences.SSHRekey[0], "",
@@ -525,17 +432,12 @@ func TestSSHPOP_AuthorizeSSHRekey(t *testing.T) {
 				p:     p,
 				token: tok,
 				code:  http.StatusBadRequest,
-				err:   errors.New("sshpop.AuthorizeSSHRekey; sshpop certificate must be a host ssh certificate"),
+				err:   errors.New("sshpop certificate must be a host ssh certificate"),
 			}
 		},
 		"ok": func(t *testing.T) test {
 			p, err := generateSSHPOP()
 			assert.FatalError(t, err)
-			p.db = &db.MockAuthDB{
-				MIsSSHRevoked: func(sn string) (bool, error) {
-					return false, nil
-				},
-			}
 			cert, jwk, err := createSSHCert(&ssh.Certificate{Serial: 123455, CertType: ssh.HostCert}, sshHostSigner)
 			assert.FatalError(t, err)
 			tok, err := generateToken("123455", p.GetName(), testAudiences.SSHRekey[0], "",
@@ -553,22 +455,24 @@ func TestSSHPOP_AuthorizeSSHRekey(t *testing.T) {
 			tc := tt(t)
 			if cert, opts, err := tc.p.AuthorizeSSHRekey(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Len(t, 3, opts)
+					assert.Len(t, 4, opts)
 					for _, o := range opts {
 						switch v := o.(type) {
+						case Interface:
 						case *sshDefaultPublicKeyValidator:
 						case *sshCertDefaultValidator:
 						case *sshCertValidityValidator:
-							assert.Equals(t, v.Claimer, tc.p.claimer)
+							assert.Equals(t, v.Claimer, tc.p.ctl.Claimer)
 						default:
-							assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+							assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 						}
 					}
 					assert.Equals(t, tc.cert.Nonce, cert.Nonce)

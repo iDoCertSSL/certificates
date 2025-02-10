@@ -2,11 +2,14 @@ package ca
 
 import (
 	"bytes"
+	"context"
+	"crypto"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -23,13 +26,11 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/keys"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/crypto/x509util"
-	stepJOSE "github.com/smallstep/cli/jose"
-	jose "gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/keyutil"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
+	"go.step.sm/crypto/x509util"
 )
 
 type ClosingBuffer struct {
@@ -52,16 +53,34 @@ func getCSR(priv interface{}) (*x509.CertificateRequest, error) {
 	return x509.ParseCertificateRequest(csrBytes)
 }
 
+func generateSubjectKeyID(pub crypto.PublicKey) ([]byte, error) {
+	b, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshaling public key")
+	}
+	info := struct {
+		Algorithm        pkix.AlgorithmIdentifier
+		SubjectPublicKey asn1.BitString
+	}{}
+	if _, err = asn1.Unmarshal(b, &info); err != nil {
+		return nil, errors.Wrap(err, "error unmarshaling public key")
+	}
+
+	//nolint:gosec // used to create the Subject Key Identifier by RFC 5280
+	hash := sha1.Sum(info.SubjectPublicKey.Bytes)
+	return hash[:], nil
+}
+
 func TestMain(m *testing.M) {
 	DisableIdentity = true
 	os.Exit(m.Run())
 }
 
 func TestCASign(t *testing.T) {
-	pub, priv, err := keys.GenerateDefaultKeyPair()
+	pub, priv, err := keyutil.GenerateDefaultKeyPair()
 	assert.FatalError(t, err)
 
-	asn1dn := &x509util.ASN1DN{
+	asn1dn := &authority.ASN1DN{
 		Country:       "Tazmania",
 		Organization:  "Acme Co",
 		Locality:      "Landscapes",
@@ -75,13 +94,9 @@ func TestCASign(t *testing.T) {
 	config.AuthorityConfig.Template = asn1dn
 	ca, err := New(config)
 	assert.FatalError(t, err)
-
-	intermediateIdentity, err := x509util.LoadIdentityFromDisk("testdata/secrets/intermediate_ca.crt",
-		"testdata/secrets/intermediate_ca_key", pemutil.WithPassword([]byte("password")))
+	intermediateCert, err := pemutil.ReadCertificate("testdata/secrets/intermediate_ca.crt")
 	assert.FatalError(t, err)
-
-	clijwk, err := stepJOSE.ParseKey("testdata/secrets/step_cli_key_priv.jwk",
-		stepJOSE.WithPassword([]byte("pass")))
+	clijwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: clijwk.Key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", clijwk.KeyID))
@@ -103,7 +118,7 @@ func TestCASign(t *testing.T) {
 				ca:     ca,
 				body:   "invalid json",
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail invalid-csr-sig": func(t *testing.T) *signTest {
@@ -141,7 +156,7 @@ ZEp7knvU2psWRw==
 				ca:     ca,
 				body:   string(body),
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail unauthorized-ott": func(t *testing.T) *signTest {
@@ -163,20 +178,20 @@ ZEp7knvU2psWRw==
 			jti, err := randutil.ASCII(32)
 			assert.FatalError(t, err)
 			cl := struct {
-				jwt.Claims
+				jose.Claims
 				SANS []string `json:"sans"`
 			}{
-				Claims: jwt.Claims{
+				Claims: jose.Claims{
 					Subject:   "invalid",
 					Issuer:    "step-cli",
-					NotBefore: jwt.NewNumericDate(now),
-					Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+					NotBefore: jose.NewNumericDate(now),
+					Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 					Audience:  validAud,
 					ID:        jti,
 				},
 				SANS: []string{"invalid"},
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			csr, err := getCSR(priv)
 			assert.FatalError(t, err)
@@ -188,28 +203,28 @@ ZEp7knvU2psWRw==
 			return &signTest{
 				ca:     ca,
 				body:   string(body),
-				status: http.StatusUnauthorized,
-				errMsg: errs.UnauthorizedDefaultMsg,
+				status: http.StatusForbidden,
+				errMsg: errs.ForbiddenPrefix,
 			}
 		},
 		"ok": func(t *testing.T) *signTest {
 			jti, err := randutil.ASCII(32)
 			assert.FatalError(t, err)
 			cl := struct {
-				jwt.Claims
+				jose.Claims
 				SANS []string `json:"sans"`
 			}{
-				Claims: jwt.Claims{
+				Claims: jose.Claims{
 					Subject:   "test.smallstep.com",
 					Issuer:    "step-cli",
-					NotBefore: jwt.NewNumericDate(now),
-					Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+					NotBefore: jose.NewNumericDate(now),
+					Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 					Audience:  validAud,
 					ID:        jti,
 				},
 				SANS: []string{"test.smallstep.com"},
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			csr, err := getCSR(priv)
 			assert.FatalError(t, err)
@@ -230,19 +245,19 @@ ZEp7knvU2psWRw==
 			jti, err := randutil.ASCII(32)
 			assert.FatalError(t, err)
 			cl := struct {
-				jwt.Claims
+				jose.Claims
 				SANS []string `json:"sans"`
 			}{
-				Claims: jwt.Claims{
+				Claims: jose.Claims{
 					Subject:   "test.smallstep.com",
 					Issuer:    "step-cli",
-					NotBefore: jwt.NewNumericDate(now),
-					Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+					NotBefore: jose.NewNumericDate(now),
+					Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 					Audience:  validAud,
 					ID:        jti,
 				},
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			csr, err := getCSR(priv)
 			assert.FatalError(t, err)
@@ -269,10 +284,14 @@ ZEp7knvU2psWRw==
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var sign api.SignResponse
 					assert.FatalError(t, readJSON(body, &sign))
@@ -282,15 +301,15 @@ ZEp7knvU2psWRw==
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							Country:       []string{asn1dn.Country},
 							Organization:  []string{asn1dn.Organization},
 							Locality:      []string{asn1dn.Locality},
 							StreetAddress: []string{asn1dn.StreetAddress},
 							Province:      []string{asn1dn.Province},
 							CommonName:    asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -299,19 +318,18 @@ ZEp7knvU2psWRw==
 						[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
 					assert.Equals(t, leaf.DNSNames, []string{"test.smallstep.com"})
 
-					pubBytes, err := x509.MarshalPKIXPublicKey(pub)
+					subjectKeyID, err := generateSubjectKeyID(pub)
 					assert.FatalError(t, err)
-					hash := sha1.Sum(pubBytes)
-					assert.Equals(t, leaf.SubjectKeyId, hash[:])
+					assert.Equals(t, leaf.SubjectKeyId, subjectKeyID)
 
-					assert.Equals(t, leaf.AuthorityKeyId, intermediateIdentity.Crt.SubjectKeyId)
+					assert.Equals(t, leaf.AuthorityKeyId, intermediateCert.SubjectKeyId)
 
-					realIntermediate, err := x509.ParseCertificate(intermediateIdentity.Crt.Raw)
+					realIntermediate, err := x509.ParseCertificate(intermediateCert.Raw)
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -345,14 +363,18 @@ func TestCAProvisioners(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tc := genTestCase(t)
 
-			rq, err := http.NewRequest("GET", fmt.Sprintf("/provisioners"), strings.NewReader(""))
+			rq, err := http.NewRequest("GET", "/provisioners", strings.NewReader(""))
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var resp api.ProvisionersResponse
 
@@ -363,8 +385,8 @@ func TestCAProvisioners(t *testing.T) {
 					assert.FatalError(t, err)
 					assert.Equals(t, a, b)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -415,17 +437,21 @@ func TestCAProvisionerEncryptedKey(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var ek api.ProvisionerKeyResponse
 					assert.FatalError(t, readJSON(body, &ek))
 					assert.Equals(t, ek.Key, tc.expectedKey)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -476,17 +502,21 @@ func TestCARoot(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var root api.RootResponse
 					assert.FatalError(t, readJSON(body, &root))
 					assert.Equals(t, root.RootPEM.Certificate, rootCrt)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -523,7 +553,8 @@ func TestCAHealth(t *testing.T) {
 			assert.FatalError(t, err)
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
@@ -538,10 +569,10 @@ func TestCAHealth(t *testing.T) {
 }
 
 func TestCARenew(t *testing.T) {
-	pub, _, err := keys.GenerateDefaultKeyPair()
+	pub, priv, err := keyutil.GenerateDefaultKeyPair()
 	assert.FatalError(t, err)
 
-	asn1dn := &x509util.ASN1DN{
+	asn1dn := &authority.ASN1DN{
 		Country:       "Tazmania",
 		Organization:  "Acme Co",
 		Locality:      "Landscapes",
@@ -557,8 +588,9 @@ func TestCARenew(t *testing.T) {
 	assert.FatalError(t, err)
 	assert.FatalError(t, err)
 
-	intermediateIdentity, err := x509util.LoadIdentityFromDisk("testdata/secrets/intermediate_ca.crt",
-		"testdata/secrets/intermediate_ca_key", pemutil.WithPassword([]byte("password")))
+	intermediateCert, err := pemutil.ReadCertificate("testdata/secrets/intermediate_ca.crt")
+	assert.FatalError(t, err)
+	intermediateKey, err := pemutil.Read("testdata/secrets/intermediate_ca_key", pemutil.WithPassword([]byte("password")))
 	assert.FatalError(t, err)
 
 	now := time.Now().UTC()
@@ -576,7 +608,7 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: nil,
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"request-missing-peer-certificate": func(t *testing.T) *renewTest {
@@ -584,19 +616,19 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{}},
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"success": func(t *testing.T) *renewTest {
-			profile, err := x509util.NewLeafProfile("test", intermediateIdentity.Crt,
-				intermediateIdentity.Key, x509util.WithPublicKey(pub),
-				x509util.WithNotBeforeAfterDuration(now, leafExpiry, 0), x509util.WithHosts("funk"))
+			cr, err := x509util.CreateCertificateRequest("test", []string{"funk"}, priv.(crypto.Signer))
 			assert.FatalError(t, err)
-			crtBytes, err := profile.CreateCertificate()
+			cert, err := x509util.NewCertificate(cr)
 			assert.FatalError(t, err)
-			crt, err := x509.ParseCertificate(crtBytes)
+			crt := cert.GetCertificate()
+			crt.NotBefore = now
+			crt.NotAfter = leafExpiry
+			crt, err = x509util.CreateCertificate(crt, intermediateCert, pub, intermediateKey.(crypto.Signer))
 			assert.FatalError(t, err)
-
 			return &renewTest{
 				ca: ca,
 				tlsConnState: &tls.ConnectionState{
@@ -616,10 +648,14 @@ func TestCARenew(t *testing.T) {
 			rq.TLS = tc.tlsConnState
 			rr := httptest.NewRecorder()
 
-			tc.ca.srv.Handler.ServeHTTP(rr, rq)
+			ctx := authority.NewContext(context.Background(), tc.ca.auth)
+			tc.ca.srv.Handler.ServeHTTP(rr, rq.WithContext(ctx))
 
 			if assert.Equals(t, rr.Code, tc.status) {
 				body := &ClosingBuffer{rr.Body}
+				resp := &http.Response{
+					Body: body,
+				}
 				if rr.Code < http.StatusBadRequest {
 					var sign api.SignResponse
 					assert.FatalError(t, readJSON(body, &sign))
@@ -629,10 +665,10 @@ func TestCARenew(t *testing.T) {
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							CommonName: asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -641,21 +677,19 @@ func TestCARenew(t *testing.T) {
 						[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
 					assert.Equals(t, leaf.DNSNames, []string{"funk"})
 
-					pubBytes, err := x509.MarshalPKIXPublicKey(pub)
+					subjectKeyID, err := generateSubjectKeyID(pub)
 					assert.FatalError(t, err)
-					hash := sha1.Sum(pubBytes)
-					assert.Equals(t, leaf.SubjectKeyId, hash[:])
+					assert.Equals(t, leaf.SubjectKeyId, subjectKeyID)
+					assert.Equals(t, leaf.AuthorityKeyId, intermediateCert.SubjectKeyId)
 
-					assert.Equals(t, leaf.AuthorityKeyId, intermediateIdentity.Crt.SubjectKeyId)
-
-					realIntermediate, err := x509.ParseCertificate(intermediateIdentity.Crt.Raw)
+					realIntermediate, err := x509.ParseCertificate(intermediateCert.Raw)
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
 
 					assert.Equals(t, *sign.TLSOptions, authority.DefaultTLSOptions)
 				} else {
-					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					err := readError(resp)
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)

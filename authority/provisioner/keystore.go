@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
 )
 
 const (
@@ -18,10 +18,11 @@ const (
 	defaultCacheJitter = 1 * time.Hour
 )
 
-var maxAgeRegex = regexp.MustCompile("max-age=([0-9]+)")
+var maxAgeRegex = regexp.MustCompile(`max-age=(\d+)`)
 
 type keyStore struct {
 	sync.RWMutex
+	client *http.Client
 	uri    string
 	keySet jose.JSONWebKeySet
 	timer  *time.Timer
@@ -29,12 +30,13 @@ type keyStore struct {
 	jitter time.Duration
 }
 
-func newKeyStore(uri string) (*keyStore, error) {
-	keys, age, err := getKeysFromJWKsURI(uri)
+func newKeyStore(client *http.Client, uri string) (*keyStore, error) {
+	keys, age, err := getKeysFromJWKsURI(client, uri)
 	if err != nil {
 		return nil, err
 	}
 	ks := &keyStore{
+		client: client,
 		uri:    uri,
 		keySet: keys,
 		expiry: getExpirationTime(age),
@@ -64,7 +66,7 @@ func (ks *keyStore) Get(kid string) (keys []jose.JSONWebKey) {
 
 func (ks *keyStore) reload() {
 	var next time.Duration
-	keys, age, err := getKeysFromJWKsURI(ks.uri)
+	keys, age, err := getKeysFromJWKsURI(ks.client, ks.uri)
 	if err != nil {
 		next = ks.nextReloadDuration(ks.jitter / 2)
 	} else {
@@ -85,14 +87,14 @@ func (ks *keyStore) reload() {
 // 0 it will randomly rotate between 0-12 hours, but every time we call to Get
 // it will automatically rotate.
 func (ks *keyStore) nextReloadDuration(age time.Duration) time.Duration {
-	n := rand.Int63n(int64(ks.jitter))
+	n := rand.Int63n(int64(ks.jitter)) //nolint:gosec // not used for cryptographic security
 	age -= time.Duration(n)
 	return abs(age)
 }
 
-func getKeysFromJWKsURI(uri string) (jose.JSONWebKeySet, time.Duration, error) {
+func getKeysFromJWKsURI(client *http.Client, uri string) (jose.JSONWebKeySet, time.Duration, error) {
 	var keys jose.JSONWebKeySet
-	resp, err := http.Get(uri)
+	resp, err := client.Get(uri)
 	if err != nil {
 		return keys, 0, errors.Wrapf(err, "failed to connect to %s", uri)
 	}
@@ -105,7 +107,7 @@ func getKeysFromJWKsURI(uri string) (jose.JSONWebKeySet, time.Duration, error) {
 
 func getCacheAge(cacheControl string) time.Duration {
 	age := defaultCacheAge
-	if len(cacheControl) > 0 {
+	if cacheControl != "" {
 		match := maxAgeRegex.FindAllStringSubmatch(cacheControl, -1)
 		if len(match) > 0 {
 			if len(match[0]) == 2 {

@@ -10,33 +10,38 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
 	"golang.org/x/crypto/ssh"
 )
 
 var (
-	defaultDisableRenewal   = false
-	defaultEnableSSHCA      = true
-	globalProvisionerClaims = Claims{
-		MinTLSDur:         &Duration{5 * time.Minute},
-		MaxTLSDur:         &Duration{24 * time.Hour},
-		DefaultTLSDur:     &Duration{24 * time.Hour},
-		DisableRenewal:    &defaultDisableRenewal,
-		MinUserSSHDur:     &Duration{Duration: 5 * time.Minute}, // User SSH certs
-		MaxUserSSHDur:     &Duration{Duration: 24 * time.Hour},
-		DefaultUserSSHDur: &Duration{Duration: 16 * time.Hour},
-		MinHostSSHDur:     &Duration{Duration: 5 * time.Minute}, // Host SSH certs
-		MaxHostSSHDur:     &Duration{Duration: 30 * 24 * time.Hour},
-		DefaultHostSSHDur: &Duration{Duration: 30 * 24 * time.Hour},
-		EnableSSHCA:       &defaultEnableSSHCA,
+	defaultDisableRenewal             = false
+	defaultAllowRenewalAfterExpiry    = false
+	defaultEnableSSHCA                = true
+	defaultDisableSmallstepExtensions = false
+	globalProvisionerClaims           = Claims{
+		MinTLSDur:                  &Duration{5 * time.Minute},
+		MaxTLSDur:                  &Duration{24 * time.Hour},
+		DefaultTLSDur:              &Duration{24 * time.Hour},
+		MinUserSSHDur:              &Duration{Duration: 5 * time.Minute}, // User SSH certs
+		MaxUserSSHDur:              &Duration{Duration: 24 * time.Hour},
+		DefaultUserSSHDur:          &Duration{Duration: 16 * time.Hour},
+		MinHostSSHDur:              &Duration{Duration: 5 * time.Minute}, // Host SSH certs
+		MaxHostSSHDur:              &Duration{Duration: 30 * 24 * time.Hour},
+		DefaultHostSSHDur:          &Duration{Duration: 30 * 24 * time.Hour},
+		EnableSSHCA:                &defaultEnableSSHCA,
+		DisableRenewal:             &defaultDisableRenewal,
+		AllowRenewalAfterExpiry:    &defaultAllowRenewalAfterExpiry,
+		DisableSmallstepExtensions: &defaultDisableSmallstepExtensions,
 	}
 	testAudiences = Audiences{
 		Sign:      []string{"https://ca.smallstep.com/1.0/sign", "https://ca.smallstep.com/sign"},
@@ -97,7 +102,7 @@ func generateJSONWebKey() (*jose.JSONWebKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	jwk.KeyID = string(hex.EncodeToString(fp))
+	jwk.KeyID = hex.EncodeToString(fp)
 	return jwk, nil
 }
 
@@ -171,23 +176,22 @@ func generateJWK() (*JWK, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
-	return &JWK{
+
+	p := &JWK{
 		Name:         name,
 		Type:         "JWK",
 		Key:          &public,
 		EncryptedKey: encrypted,
 		Claims:       &globalProvisionerClaims,
-		audiences:    testAudiences,
-		claimer:      claimer,
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
-	fooPubB, err := ioutil.ReadFile("./testdata/certs/foo.pub")
+	fooPubB, err := os.ReadFile("./testdata/certs/foo.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +199,7 @@ func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
 	if err != nil {
 		return nil, err
 	}
-	barPubB, err := ioutil.ReadFile("./testdata/certs/bar.pub")
+	barPubB, err := os.ReadFile("./testdata/certs/bar.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -204,23 +208,21 @@ func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
 		return nil, err
 	}
 
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
 	pubKeys := []interface{}{fooPub, barPub}
 	if inputPubKey != nil {
 		pubKeys = append(pubKeys, inputPubKey)
 	}
 
-	return &K8sSA{
-		Name:      K8sSAName,
-		Type:      "K8sSA",
-		Claims:    &globalProvisionerClaims,
-		audiences: testAudiences,
-		claimer:   claimer,
-		pubKeys:   pubKeys,
-	}, nil
+	p := &K8sSA{
+		Name:    K8sSAName,
+		Type:    "K8sSA",
+		Claims:  &globalProvisionerClaims,
+		pubKeys: pubKeys,
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateSSHPOP() (*SSHPOP, error) {
@@ -228,12 +230,7 @@ func generateSSHPOP() (*SSHPOP, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
-
-	userB, err := ioutil.ReadFile("./testdata/certs/ssh_user_ca_key.pub")
+	userB, err := os.ReadFile("./testdata/certs/ssh_user_ca_key.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +238,7 @@ func generateSSHPOP() (*SSHPOP, error) {
 	if err != nil {
 		return nil, err
 	}
-	hostB, err := ioutil.ReadFile("./testdata/certs/ssh_host_ca_key.pub")
+	hostB, err := os.ReadFile("./testdata/certs/ssh_host_ca_key.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -250,17 +247,19 @@ func generateSSHPOP() (*SSHPOP, error) {
 		return nil, err
 	}
 
-	return &SSHPOP{
-		Name:      name,
-		Type:      "SSHPOP",
-		Claims:    &globalProvisionerClaims,
-		audiences: testAudiences,
-		claimer:   claimer,
+	p := &SSHPOP{
+		Name:   name,
+		Type:   "SSHPOP",
+		Claims: &globalProvisionerClaims,
 		sshPubKeys: &SSHKeys{
 			UserKeys: []ssh.PublicKey{userKey},
 			HostKeys: []ssh.PublicKey{hostKey},
 		},
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateX5C(root []byte) (*X5C, error) {
@@ -282,11 +281,6 @@ M46l92gdOozT
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
-
 	rootPool := x509.NewCertPool()
 
 	var (
@@ -304,15 +298,17 @@ M46l92gdOozT
 		}
 		rootPool.AddCert(cert)
 	}
-	return &X5C{
-		Name:      name,
-		Type:      "X5C",
-		Roots:     root,
-		Claims:    &globalProvisionerClaims,
-		audiences: testAudiences,
-		claimer:   claimer,
-		rootPool:  rootPool,
-	}, nil
+	p := &X5C{
+		Name:     name,
+		Type:     "X5C",
+		Roots:    root,
+		Claims:   &globalProvisionerClaims,
+		rootPool: rootPool,
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateOIDC() (*OIDC, error) {
@@ -332,11 +328,7 @@ func generateOIDC() (*OIDC, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
-	return &OIDC{
+	p := &OIDC{
 		Name:                  name,
 		Type:                  "OIDC",
 		ClientID:              clientID,
@@ -350,8 +342,11 @@ func generateOIDC() (*OIDC, error) {
 			keySet: jose.JSONWebKeySet{Keys: []jose.JSONWebKey{*jwk}},
 			expiry: time.Now().Add(24 * time.Hour),
 		},
-		claimer: claimer,
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateGCP() (*GCP, error) {
@@ -367,23 +362,23 @@ func generateGCP() (*GCP, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
-	return &GCP{
-		Type:            "GCP",
-		Name:            name,
-		ServiceAccounts: []string{serviceAccount},
-		Claims:          &globalProvisionerClaims,
-		claimer:         claimer,
-		config:          newGCPConfig(),
+	p := &GCP{
+		Type:             "GCP",
+		Name:             name,
+		ServiceAccounts:  []string{serviceAccount},
+		Claims:           &globalProvisionerClaims,
+		DisableSSHCAHost: &DefaultDisableSSHCAHost,
+		DisableSSHCAUser: &DefaultDisableSSHCAUser,
+		config:           newGCPConfig(),
 		keyStore: &keyStore{
 			keySet: jose.JSONWebKeySet{Keys: []jose.JSONWebKey{*jwk}},
 			expiry: time.Now().Add(24 * time.Hour),
 		},
-		audiences: testAudiences.WithFragment("gcp/" + name),
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences.WithFragment("gcp/" + name),
+	}, nil)
+	return p, err
 }
 
 func generateAWS() (*AWS, error) {
@@ -395,7 +390,111 @@ func generateAWS() (*AWS, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
+	block, _ := pem.Decode([]byte(awsTestCertificate))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("error decoding AWS certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "error parsing AWS certificate")
+	}
+	p := &AWS{
+		Type:         "AWS",
+		Name:         name,
+		Accounts:     []string{accountID},
+		Claims:       &globalProvisionerClaims,
+		IMDSVersions: []string{"v2", "v1"},
+		config: &awsConfig{
+			identityURL:        awsIdentityURL,
+			signatureURL:       awsSignatureURL,
+			tokenURL:           awsAPITokenURL,
+			tokenTTL:           awsAPITokenTTL,
+			certificates:       []*x509.Certificate{cert},
+			signatureAlgorithm: awsSignatureAlgorithm,
+		},
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences.WithFragment("aws/" + name),
+	}, nil)
+	return p, err
+}
+
+func generateAWSWithServer() (*AWS, *httptest.Server, error) {
+	aws, err := generateAWS()
+	if err != nil {
+		return nil, nil, err
+	}
+	block, _ := pem.Decode([]byte(awsTestKey))
+	if block == nil || block.Type != "RSA PRIVATE KEY" {
+		return nil, nil, errors.New("error decoding AWS key")
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "error parsing AWS private key")
+	}
+	doc, err := json.MarshalIndent(awsInstanceIdentityDocument{
+		AccountID:        aws.Accounts[0],
+		Architecture:     "x86_64",
+		AvailabilityZone: "us-west-2b",
+		ImageID:          "image-id",
+		InstanceID:       "instance-id",
+		InstanceType:     "t2.micro",
+		PendingTime:      time.Now(),
+		PrivateIP:        "127.0.0.1",
+		Region:           "us-west-1",
+		Version:          "2017-09-30",
+	}, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sum := sha256.Sum256(doc)
+	signature, err := key.Sign(rand.Reader, sum[:], crypto.SHA256)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "error signing document")
+	}
+	//nolint:gosec // tests minimum size of the key
+	token := "AQAEAEEO9-7Z88ewKFpboZuDlFYWz9A3AN-wMOVzjEhfAyXW31BvVw=="
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest/dynamic/instance-identity/document":
+			// check for API token
+			if r.Header.Get("X-aws-ec2-metadata-token") != token {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte("401 Unauthorized"))
+			}
+			w.Write(doc)
+		case "/latest/dynamic/instance-identity/signature":
+			// check for API token
+			if r.Header.Get("X-aws-ec2-metadata-token") != token {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte("401 Unauthorized"))
+			}
+			w.Write([]byte(base64.StdEncoding.EncodeToString(signature)))
+		case "/latest/api/token":
+			w.Write([]byte(token))
+		case "/bad-document":
+			w.Write([]byte("{}"))
+		case "/bad-signature":
+			w.Write([]byte("YmFkLXNpZ25hdHVyZQo="))
+		case "/bad-json":
+			w.Write([]byte("{"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	aws.config.identityURL = srv.URL + "/latest/dynamic/instance-identity/document"
+	aws.config.signatureURL = srv.URL + "/latest/dynamic/instance-identity/signature"
+	aws.config.tokenURL = srv.URL + "/latest/api/token"
+	return aws, srv, nil
+}
+
+func generateAWSV1Only() (*AWS, error) {
+	name, err := randutil.Alphanumeric(10)
+	if err != nil {
+		return nil, err
+	}
+	accountID, err := randutil.Alphanumeric(10)
 	if err != nil {
 		return nil, err
 	}
@@ -407,24 +506,29 @@ func generateAWS() (*AWS, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "error parsing AWS certificate")
 	}
-	return &AWS{
-		Type:     "AWS",
-		Name:     name,
-		Accounts: []string{accountID},
-		Claims:   &globalProvisionerClaims,
-		claimer:  claimer,
+	p := &AWS{
+		Type:         "AWS",
+		Name:         name,
+		Accounts:     []string{accountID},
+		Claims:       &globalProvisionerClaims,
+		IMDSVersions: []string{"v1"},
 		config: &awsConfig{
 			identityURL:        awsIdentityURL,
 			signatureURL:       awsSignatureURL,
-			certificate:        cert,
+			tokenURL:           awsAPITokenURL,
+			tokenTTL:           awsAPITokenTTL,
+			certificates:       []*x509.Certificate{cert},
 			signatureAlgorithm: awsSignatureAlgorithm,
 		},
-		audiences: testAudiences.WithFragment("aws/" + name),
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences.WithFragment("aws/" + name),
+	}, nil)
+	return p, err
 }
 
-func generateAWSWithServer() (*AWS, *httptest.Server, error) {
-	aws, err := generateAWS()
+func generateAWSWithServerV1Only() (*AWS, *httptest.Server, error) {
+	aws, err := generateAWSV1Only()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -487,21 +591,16 @@ func generateAzure() (*Azure, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimer, err := NewClaimer(nil, globalProvisionerClaims)
-	if err != nil {
-		return nil, err
-	}
 	jwk, err := generateJSONWebKey()
 	if err != nil {
 		return nil, err
 	}
-	return &Azure{
+	p := &Azure{
 		Type:     "Azure",
 		Name:     name,
 		TenantID: tenantID,
 		Audience: azureDefaultAudience,
 		Claims:   &globalProvisionerClaims,
-		claimer:  claimer,
 		config:   newAzureConfig(tenantID),
 		oidcConfig: openIDConfiguration{
 			Issuer:    "https://sts.windows.net/" + tenantID + "/",
@@ -511,7 +610,11 @@ func generateAzure() (*Azure, error) {
 			keySet: jose.JSONWebKeySet{Keys: []jose.JSONWebKey{*jwk}},
 			expiry: time.Now().Add(24 * time.Hour),
 		},
-	}, nil
+	}
+	p.ctl, err = NewController(p, p.Claims, Config{
+		Audiences: testAudiences,
+	}, nil)
+	return p, err
 }
 
 func generateAzureWithServer() (*Azure, *httptest.Server, error) {
@@ -558,7 +661,7 @@ func generateAzureWithServer() (*Azure, *httptest.Server, error) {
 			w.Header().Add("Cache-Control", "max-age=5")
 			writeJSON(w, getPublic(az.keyStore.keySet))
 		case "/metadata/identity/oauth2/token":
-			tok, err := generateAzureToken("subject", issuer, "https://management.azure.com/", az.TenantID, "subscriptionID", "resourceGroup", "virtualMachine", time.Now(), &az.keyStore.keySet.Keys[0])
+			tok, err := generateAzureToken("subject", issuer, "https://management.azure.com/", az.TenantID, "subscriptionID", "resourceGroup", "virtualMachine", "vm", time.Now(), &az.keyStore.keySet.Keys[0])
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			} else {
@@ -566,6 +669,9 @@ func generateAzureWithServer() (*Azure, *httptest.Server, error) {
 					AccessToken: tok,
 				})
 			}
+		case "/metadata/instance/compute/azEnvironment":
+			w.Header().Add("Content-Type", "text/plain")
+			w.Write([]byte("AzurePublicCloud"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -573,6 +679,7 @@ func generateAzureWithServer() (*Azure, *httptest.Server, error) {
 	srv.Start()
 	az.config.oidcDiscoveryURL = srv.URL + "/" + az.TenantID + "/.well-known/openid-configuration"
 	az.config.identityTokenURL = srv.URL + "/metadata/identity/oauth2/token"
+	az.config.instanceComputeURL = srv.URL + "/metadata/instance/compute/azEnvironment"
 	return az, srv, nil
 }
 
@@ -619,7 +726,7 @@ func withSSHPOPFile(cert *ssh.Certificate) tokOption {
 	}
 }
 
-func generateToken(sub, iss, aud string, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
+func generateToken(sub, iss, aud, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
 	so := new(jose.SignerOptions)
 	so.WithType("JWT")
 	so.WithHeader("kid", jwk.KeyID)
@@ -656,6 +763,78 @@ func generateToken(sub, iss, aud string, email string, sans []string, iat time.T
 		},
 		Email: email,
 		SANS:  sans,
+	}
+	return jose.Signed(sig).Claims(claims).CompactSerialize()
+}
+
+func generateCustomToken(sub, iss, aud string, jwk *jose.JSONWebKey, extraHeaders, extraClaims map[string]any) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for k, v := range extraHeaders {
+		so.WithHeader(jose.HeaderKey(k), v)
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := randutil.ASCII(64)
+	if err != nil {
+		return "", err
+	}
+	iat := time.Now()
+	claims := jose.Claims{
+		ID:        id,
+		Subject:   sub,
+		Issuer:    iss,
+		IssuedAt:  jose.NewNumericDate(iat),
+		NotBefore: jose.NewNumericDate(iat),
+		Expiry:    jose.NewNumericDate(iat.Add(5 * time.Minute)),
+		Audience:  []string{aud},
+	}
+	return jose.Signed(sig).Claims(claims).Claims(extraClaims).CompactSerialize()
+}
+
+func generateOIDCToken(sub, iss, aud, email, preferredUsername string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for _, o := range tokOpts {
+		if err := o(so); err != nil {
+			return "", err
+		}
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := randutil.ASCII(64)
+	if err != nil {
+		return "", err
+	}
+
+	claims := struct {
+		jose.Claims
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferred_username,omitempty"`
+	}{
+		Claims: jose.Claims{
+			ID:        id,
+			Subject:   sub,
+			Issuer:    iss,
+			IssuedAt:  jose.NewNumericDate(iat),
+			NotBefore: jose.NewNumericDate(iat),
+			Expiry:    jose.NewNumericDate(iat.Add(5 * time.Minute)),
+			Audience:  []string{aud},
+		},
+		Email:             email,
+		PreferredUsername: preferredUsername,
 	}
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
@@ -713,20 +892,20 @@ func generateK8sSAToken(jwk *jose.JSONWebKey, claims *k8sSAPayload, tokOpts ...t
 }
 
 func generateSimpleSSHUserToken(iss, aud string, jwk *jose.JSONWebKey) (string, error) {
-	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &SSHOptions{
+	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &SignSSHOptions{
 		CertType:   "user",
 		Principals: []string{"name"},
 	}, jwk)
 }
 
 func generateSimpleSSHHostToken(iss, aud string, jwk *jose.JSONWebKey) (string, error) {
-	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &SSHOptions{
+	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &SignSSHOptions{
 		CertType:   "host",
 		Principals: []string{"smallstep.com"},
 	}, jwk)
 }
 
-func generateSSHToken(sub, iss, aud string, iat time.Time, sshOpts *SSHOptions, jwk *jose.JSONWebKey) (string, error) {
+func generateSSHToken(sub, iss, aud string, iat time.Time, sshOpts *SignSSHOptions, jwk *jose.JSONWebKey) (string, error) {
 	sig, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
 		new(jose.SignerOptions).WithType("JWT").WithHeader("kid", jwk.KeyID),
@@ -798,7 +977,7 @@ func generateGCPToken(sub, iss, aud, instanceID, instanceName, projectID, zone s
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
 
-func generateAWSToken(sub, iss, aud, accountID, instanceID, privateIP, region string, iat time.Time, key crypto.Signer) (string, error) {
+func generateAWSToken(p *AWS, sub, iss, aud, accountID, instanceID, privateIP, region string, iat time.Time, key crypto.Signer) (string, error) {
 	doc, err := json.MarshalIndent(awsInstanceIdentityDocument{
 		AccountID:        accountID,
 		Architecture:     "x86_64",
@@ -834,8 +1013,12 @@ func generateAWSToken(sub, iss, aud, accountID, instanceID, privateIP, region st
 		return "", err
 	}
 
+	unique := fmt.Sprintf("%s.%s", p.GetID(), instanceID)
+	sum = sha256.Sum256([]byte(unique))
+
 	claims := awsPayload{
 		Claims: jose.Claims{
+			ID:        strings.ToLower(hex.EncodeToString(sum[:])),
 			Subject:   sub,
 			Issuer:    iss,
 			IssuedAt:  jose.NewNumericDate(iat),
@@ -851,13 +1034,19 @@ func generateAWSToken(sub, iss, aud, accountID, instanceID, privateIP, region st
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
 
-func generateAzureToken(sub, iss, aud, tenantID, subscriptionID, resourceGroup, virtualMachine string, iat time.Time, jwk *jose.JSONWebKey) (string, error) {
+func generateAzureToken(sub, iss, aud, tenantID, subscriptionID, resourceGroup, resourceName, resourceType string, iat time.Time, jwk *jose.JSONWebKey) (string, error) {
 	sig, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
 		new(jose.SignerOptions).WithType("JWT").WithHeader("kid", jwk.KeyID),
 	)
 	if err != nil {
 		return "", err
+	}
+	var xmsMirID string
+	if resourceType == "vm" {
+		xmsMirID = fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s", subscriptionID, resourceGroup, resourceName)
+	} else if resourceType == "uai" {
+		xmsMirID = fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ManagedIdentity/userAssignedIdentities/%s", subscriptionID, resourceGroup, resourceName)
 	}
 
 	claims := azurePayload{
@@ -876,7 +1065,7 @@ func generateAzureToken(sub, iss, aud, tenantID, subscriptionID, resourceGroup, 
 		ObjectID:         "the-oid",
 		TenantID:         tenantID,
 		Version:          "the-version",
-		XMSMirID:         fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s", subscriptionID, resourceGroup, virtualMachine),
+		XMSMirID:         xmsMirID,
 	}
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
@@ -910,7 +1099,7 @@ func parseAWSToken(token string) (*jose.JSONWebToken, *awsPayload, error) {
 	return tok, claims, nil
 }
 
-func generateJWKServer(n int) *httptest.Server {
+func generateJWKServerHandler(n int, srv *httptest.Server) http.Handler {
 	hits := struct {
 		Hits int `json:"hits"`
 	}{}
@@ -933,8 +1122,7 @@ func generateJWKServer(n int) *httptest.Server {
 	}
 
 	defaultKeySet := must(generateJSONWebKeySet(n))[0].(jose.JSONWebKeySet)
-	srv := httptest.NewUnstartedServer(nil)
-	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Hits++
 		switch r.RequestURI {
 		case "/error":
@@ -943,6 +1131,8 @@ func generateJWKServer(n int) *httptest.Server {
 			writeJSON(w, hits)
 		case "/.well-known/openid-configuration":
 			writeJSON(w, openIDConfiguration{Issuer: "the-issuer", JWKSetURI: srv.URL + "/jwks_uri"})
+		case "/common/.well-known/openid-configuration":
+			writeJSON(w, openIDConfiguration{Issuer: "https://login.microsoftonline.com/{tenantid}/v2.0", JWKSetURI: srv.URL + "/jwks_uri"})
 		case "/random":
 			keySet := must(generateJSONWebKeySet(n))[0].(jose.JSONWebKeySet)
 			w.Header().Add("Cache-Control", "max-age=5")
@@ -958,8 +1148,19 @@ func generateJWKServer(n int) *httptest.Server {
 			writeJSON(w, getPublic(defaultKeySet))
 		}
 	})
+}
 
+func generateJWKServer(n int) *httptest.Server {
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config.Handler = generateJWKServerHandler(n, srv)
 	srv.Start()
+	return srv
+}
+
+func generateTLSJWKServer(n int) *httptest.Server {
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config.Handler = generateJWKServerHandler(n, srv)
+	srv.StartTLS()
 	return srv
 }
 

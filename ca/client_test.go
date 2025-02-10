@@ -8,21 +8,26 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/smallstep/assert"
+	"github.com/google/uuid"
 	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/api/read"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/ca/client"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/x509util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.step.sm/crypto/x509util"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -103,52 +108,49 @@ DCbKzWTW8lqVdp9Kyf7XEhhc2R8C5w==
 -----END CERTIFICATE REQUEST-----`
 )
 
-func mustKey() *ecdsa.PrivateKey {
+func mustKey(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
 	return priv
 }
 
-func parseCertificate(data string) *x509.Certificate {
+func parseCertificate(t *testing.T, data string) *x509.Certificate {
+	t.Helper()
 	block, _ := pem.Decode([]byte(data))
 	if block == nil {
-		panic("failed to parse certificate PEM")
+		require.Fail(t, "failed to parse certificate PEM")
+		return nil
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		panic("failed to parse certificate: " + err.Error())
-	}
+	require.NoError(t, err, "failed to parse certificate")
 	return cert
 }
 
-func parseCertificateRequest(data string) *x509.CertificateRequest {
+func parseCertificateRequest(t *testing.T, csrPEM string) *x509.CertificateRequest {
+	t.Helper()
 	block, _ := pem.Decode([]byte(csrPEM))
 	if block == nil {
-		panic("failed to parse certificate request PEM")
+		require.Fail(t, "failed to parse certificate request PEM")
+		return nil
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
-	if err != nil {
-		panic("failed to parse certificate request: " + err.Error())
-	}
+	require.NoError(t, err, "failed to parse certificate request")
 	return csr
 }
 
-func equalJSON(t *testing.T, a interface{}, b interface{}) bool {
+func equalJSON(t *testing.T, a, b interface{}) bool {
+	t.Helper()
 	if reflect.DeepEqual(a, b) {
 		return true
 	}
+
 	ab, err := json.Marshal(a)
-	if err != nil {
-		t.Error(err)
-		return false
-	}
+	require.NoError(t, err)
+
 	bb, err := json.Marshal(b)
-	if err != nil {
-		t.Error(err)
-		return false
-	}
+	require.NoError(t, err)
+
 	return bytes.Equal(ab, bb)
 }
 
@@ -173,32 +175,23 @@ func TestClient_Version(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Version()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Client.Version() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.EqualError(t, err, tt.expectedErr.Error())
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Version() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, tt.expectedErr.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Version() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -223,40 +216,30 @@ func TestClient_Health(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Health()
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Health() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.EqualError(t, err, tt.expectedErr.Error())
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Health() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, tt.expectedErr.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Health() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
 
 func TestClient_Root(t *testing.T) {
 	ok := &api.RootResponse{
-		RootPEM: api.Certificate{Certificate: parseCertificate(rootPEM)},
+		RootPEM: api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 	}
 
 	tests := []struct {
@@ -277,51 +260,42 @@ func TestClient_Root(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				expected := "/root/" + tt.shasum
-				if req.RequestURI != expected {
-					t.Errorf("RequestURI = %s, want %s", req.RequestURI, expected)
+				if r.RequestURI != expected {
+					t.Errorf("RequestURI = %s, want %s", r.RequestURI, expected)
 				}
-				api.JSONStatus(w, tt.response, tt.responseCode)
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Root(tt.shasum)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Client.Root() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.EqualError(t, err, tt.expectedErr.Error())
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Root() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, tt.expectedErr.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Root() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
 
 func TestClient_Sign(t *testing.T) {
 	ok := &api.SignResponse{
-		ServerPEM: api.Certificate{Certificate: parseCertificate(certPEM)},
-		CaPEM:     api.Certificate{Certificate: parseCertificate(rootPEM)},
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 		CertChainPEM: []api.Certificate{
-			{Certificate: parseCertificate(certPEM)},
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 	request := &api.SignRequest{
-		CsrPEM:    api.CertificateRequest{CertificateRequest: parseCertificateRequest(csrPEM)},
+		CsrPEM:    api.CertificateRequest{CertificateRequest: parseCertificateRequest(t, csrPEM)},
 		OTT:       "the-ott",
 		NotBefore: api.NewTimeDuration(time.Now()),
 		NotAfter:  api.NewTimeDuration(time.Now().AddDate(0, 1, 0)),
@@ -337,8 +311,8 @@ func TestClient_Sign(t *testing.T) {
 	}{
 		{"ok", request, ok, 200, false, nil},
 		{"unauthorized", request, errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
-		{"empty request", &api.SignRequest{}, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
-		{"nil request", nil, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
+		{"empty request", &api.SignRequest{}, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix + "force.")},
+		{"nil request", nil, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix + "force.")},
 	}
 
 	srv := httptest.NewServer(nil)
@@ -347,17 +321,14 @@ func TestClient_Sign(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body := new(api.SignRequest)
-				if err := api.ReadJSON(req.Body, body); err != nil {
+				if err := read.JSON(r.Body, body); err != nil {
 					e, ok := tt.response.(error)
-					assert.Fatal(t, ok, "response expected to be error type")
-					api.WriteError(w, e)
+					require.True(t, ok, "response expected to be error type")
+					render.Error(w, r, e)
 					return
 				} else if !equalJSON(t, body, tt.request) {
 					if tt.request == nil {
@@ -368,27 +339,20 @@ func TestClient_Sign(t *testing.T) {
 						t.Errorf("Client.Sign() request = %v, wants %v", body, tt.request)
 					}
 				}
-				api.JSONStatus(w, tt.response, tt.responseCode)
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Sign(tt.request)
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Sign() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.EqualError(t, err, tt.expectedErr.Error())
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Sign() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, tt.expectedErr.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Sign() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -410,7 +374,7 @@ func TestClient_Revoke(t *testing.T) {
 	}{
 		{"ok", request, ok, 200, false, nil},
 		{"unauthorized", request, errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
-		{"nil request", nil, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
+		{"nil request", nil, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
 	}
 
 	srv := httptest.NewServer(nil)
@@ -419,17 +383,14 @@ func TestClient_Revoke(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body := new(api.RevokeRequest)
-				if err := api.ReadJSON(req.Body, body); err != nil {
+				if err := read.JSON(r.Body, body); err != nil {
 					e, ok := tt.response.(error)
-					assert.Fatal(t, ok, "response expected to be error type")
-					api.WriteError(w, e)
+					require.True(t, ok, "response expected to be error type")
+					render.Error(w, r, e)
 					return
 				} else if !equalJSON(t, body, tt.request) {
 					if tt.request == nil {
@@ -440,38 +401,31 @@ func TestClient_Revoke(t *testing.T) {
 						t.Errorf("Client.Revoke() request = %v, wants %v", body, tt.request)
 					}
 				}
-				api.JSONStatus(w, tt.response, tt.responseCode)
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Revoke(tt.request, nil)
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Revoke() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.True(t, strings.HasPrefix(err.Error(), tt.expectedErr.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Revoke() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, tt.expectedErr.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Revoke() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
 
 func TestClient_Renew(t *testing.T) {
 	ok := &api.SignResponse{
-		ServerPEM: api.Certificate{Certificate: parseCertificate(certPEM)},
-		CaPEM:     api.Certificate{Certificate: parseCertificate(rootPEM)},
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 		CertChainPEM: []api.Certificate{
-			{Certificate: parseCertificate(certPEM)},
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 
@@ -484,8 +438,8 @@ func TestClient_Renew(t *testing.T) {
 	}{
 		{"ok", ok, 200, false, nil},
 		{"unauthorized", errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
-		{"empty request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
-		{"nil request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
+		{"empty request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
+		{"nil request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
 	}
 
 	srv := httptest.NewServer(nil)
@@ -494,37 +448,144 @@ func TestClient_Renew(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Renew(nil)
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Renew() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Renew() = %v, want nil", got)
-				}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
+		})
+	}
+}
 
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tt.responseCode)
-				assert.HasPrefix(t, tt.err.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Renew() = %v, want %v", got, tt.response)
+func TestClient_RenewWithToken(t *testing.T) {
+	ok := &api.SignResponse{
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
+		CertChainPEM: []api.Certificate{
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
+		},
+	}
+
+	tests := []struct {
+		name         string
+		response     interface{}
+		responseCode int
+		wantErr      bool
+		err          error
+	}{
+		{"ok", ok, 200, false, nil},
+		{"unauthorized", errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
+		{"empty request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
+		{"nil request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
+	}
+
+	srv := httptest.NewServer(nil)
+	defer srv.Close()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
+			require.NoError(t, err)
+
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer token" {
+					render.JSONStatus(w, r, errs.InternalServer("force"), 500)
+				} else {
+					render.JSONStatus(w, r, tt.response, tt.responseCode)
 				}
+			})
+
+			got, err := c.RenewWithToken("token")
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
+				return
 			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
+		})
+	}
+}
+
+func TestClient_Rekey(t *testing.T) {
+	ok := &api.SignResponse{
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
+		CertChainPEM: []api.Certificate{
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
+		},
+	}
+
+	request := &api.RekeyRequest{
+		CsrPEM: api.CertificateRequest{CertificateRequest: parseCertificateRequest(t, csrPEM)},
+	}
+
+	tests := []struct {
+		name         string
+		request      *api.RekeyRequest
+		response     interface{}
+		responseCode int
+		wantErr      bool
+		err          error
+	}{
+		{"ok", request, ok, 200, false, nil},
+		{"unauthorized", request, errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
+		{"empty request", &api.RekeyRequest{}, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
+		{"nil request", nil, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
+	}
+
+	srv := httptest.NewServer(nil)
+	defer srv.Close()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
+			require.NoError(t, err)
+
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
+			})
+
+			got, err := c.Rekey(tt.request, nil)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -556,35 +617,26 @@ func TestClient_Provisioners(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				if req.RequestURI != tt.expectedURI {
-					t.Errorf("RequestURI = %s, want %s", req.RequestURI, tt.expectedURI)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.RequestURI != tt.expectedURI {
+					t.Errorf("RequestURI = %s, want %s", r.RequestURI, tt.expectedURI)
 				}
-				api.JSONStatus(w, tt.response, tt.responseCode)
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Provisioners(tt.args...)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Client.Provisioners() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.True(t, strings.HasPrefix(err.Error(), errs.InternalServerErrorDefaultMsg))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Provisioners() = %v, want nil", got)
-				}
-				assert.HasPrefix(t, errs.InternalServerErrorDefaultMsg, err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Provisioners() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -612,40 +664,31 @@ func TestClient_ProvisionerKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				expected := "/provisioners/" + tt.kid + "/encrypted-key"
-				if req.RequestURI != expected {
-					t.Errorf("RequestURI = %s, want %s", req.RequestURI, expected)
+				if r.RequestURI != expected {
+					t.Errorf("RequestURI = %s, want %s", r.RequestURI, expected)
 				}
-				api.JSONStatus(w, tt.response, tt.responseCode)
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.ProvisionerKey(tt.kid)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Client.ProvisionerKey() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.ProvisionerKey() = %v, want nil", got)
-				}
-
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tt.responseCode)
-				assert.HasPrefix(t, tt.err.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.ProvisionerKey() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -653,7 +696,7 @@ func TestClient_ProvisionerKey(t *testing.T) {
 func TestClient_Roots(t *testing.T) {
 	ok := &api.RootsResponse{
 		Certificates: []api.Certificate{
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 
@@ -666,7 +709,7 @@ func TestClient_Roots(t *testing.T) {
 	}{
 		{"ok", ok, 200, false, nil},
 		{"unauthorized", errs.Unauthorized("force"), 401, true, errors.New(errs.UnauthorizedDefaultMsg)},
-		{"bad-request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
+		{"bad-request", errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
 	}
 
 	srv := httptest.NewServer(nil)
@@ -675,36 +718,27 @@ func TestClient_Roots(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Roots()
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Roots() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Roots() = %v, want nil", got)
-				}
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tt.responseCode)
-				assert.HasPrefix(t, tt.err.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Roots() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -712,7 +746,7 @@ func TestClient_Roots(t *testing.T) {
 func TestClient_Federation(t *testing.T) {
 	ok := &api.FederationResponse{
 		Certificates: []api.Certificate{
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 
@@ -733,45 +767,34 @@ func TestClient_Federation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.Federation()
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.Federation() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.Federation() = %v, want nil", got)
-				}
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tt.responseCode)
-				assert.HasPrefix(t, tt.err.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.Federation() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
 
 func TestClient_SSHRoots(t *testing.T) {
-	key, err := ssh.NewPublicKey(mustKey().Public())
-	if err != nil {
-		t.Fatal(err)
-	}
+	key, err := ssh.NewPublicKey(mustKey(t).Public())
+	require.NoError(t, err)
 
 	ok := &api.SSHRootsResponse{
 		HostKeys: []api.SSHPublicKey{{PublicKey: key}},
@@ -795,36 +818,27 @@ func TestClient_SSHRoots(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.SSHRoots()
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.SSHKeys() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					var sc render.StatusCodedError
+					if assert.ErrorAs(t, err, &sc) {
+						assert.Equal(t, tt.responseCode, sc.StatusCode())
+					}
+					assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.SSHKeys() = %v, want nil", got)
-				}
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-				assert.Equals(t, sc.StatusCode(), tt.responseCode)
-				assert.HasPrefix(t, tt.err.Error(), err.Error())
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.SSHKeys() = %v, want %v", got, tt.response)
-				}
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
 		})
 	}
 }
@@ -856,13 +870,14 @@ func Test_parseEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := parseEndpoint(tt.args.endpoint)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseEndpoint() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, got)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseEndpoint() = %v, want %v", got, tt.want)
-			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -895,24 +910,21 @@ func TestClient_RootFingerprint(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := tt.server.Client().Transport
 			c, err := NewClient(tt.server.URL, WithTransport(tr))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			tt.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			tt.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.RootFingerprint()
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.RootFingerprint() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Empty(t, got)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Client.RootFingerprint() = %v, want %v", got, tt.want)
-			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -921,12 +933,12 @@ func TestClient_RootFingerprintWithServer(t *testing.T) {
 	srv := startCABootstrapServer()
 	defer srv.Close()
 
-	client, err := NewClient(srv.URL+"/sign", WithRootFile("testdata/secrets/root_ca.crt"))
-	assert.FatalError(t, err)
+	caClient, err := NewClient(srv.URL+"/sign", WithRootFile("testdata/secrets/root_ca.crt"))
+	require.NoError(t, err)
 
-	fp, err := client.RootFingerprint()
-	assert.FatalError(t, err)
-	assert.Equals(t, "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7", fp)
+	fp, err := caClient.RootFingerprint()
+	assert.NoError(t, err)
+	assert.Equal(t, "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7", fp)
 }
 
 func TestClient_SSHBastion(t *testing.T) {
@@ -947,7 +959,7 @@ func TestClient_SSHBastion(t *testing.T) {
 	}{
 		{"ok", &api.SSHBastionRequest{Hostname: "host.local"}, ok, 200, false, nil},
 		{"bad-response", &api.SSHBastionRequest{Hostname: "host.local"}, "bad json", 200, true, nil},
-		{"bad-request", &api.SSHBastionRequest{}, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestDefaultMsg)},
+		{"bad-request", &api.SSHBastionRequest{}, errs.BadRequest("force"), 400, true, errors.New(errs.BadRequestPrefix)},
 	}
 
 	srv := httptest.NewServer(nil)
@@ -956,38 +968,101 @@ func TestClient_SSHBastion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := NewClient(srv.URL, WithTransport(http.DefaultTransport))
-			if err != nil {
-				t.Errorf("NewClient() error = %v", err)
-				return
-			}
+			require.NoError(t, err)
 
-			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				api.JSONStatus(w, tt.response, tt.responseCode)
+			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				render.JSONStatus(w, r, tt.response, tt.responseCode)
 			})
 
 			got, err := c.SSHBastion(tt.request)
-			if (err != nil) != tt.wantErr {
-				fmt.Printf("%+v", err)
-				t.Errorf("Client.SSHBastion() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					if tt.responseCode != 200 {
+						var sc render.StatusCodedError
+						if assert.ErrorAs(t, err, &sc) {
+							assert.Equal(t, tt.responseCode, sc.StatusCode())
+						}
+						assert.True(t, strings.HasPrefix(err.Error(), tt.err.Error()))
+					}
+				}
+				assert.Nil(t, got)
 				return
 			}
 
-			switch {
-			case err != nil:
-				if got != nil {
-					t.Errorf("Client.SSHBastion() = %v, want nil", got)
-				}
-				if tt.responseCode != 200 {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tt.responseCode)
-					assert.HasPrefix(t, tt.err.Error(), err.Error())
-				}
-			default:
-				if !reflect.DeepEqual(got, tt.response) {
-					t.Errorf("Client.SSHBastion() = %v, want %v", got, tt.response)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.response, got)
+		})
+	}
+}
+
+func TestClient_GetCaURL(t *testing.T) {
+	tests := []struct {
+		name  string
+		caURL string
+		want  string
+	}{
+		{"ok", "https://ca.com", "https://ca.com"},
+		{"ok no schema", "ca.com", "https://ca.com"},
+		{"ok with port", "https://ca.com:9000", "https://ca.com:9000"},
+		{"ok with version", "https://ca.com/1.0", "https://ca.com/1.0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(tt.caURL, WithTransport(http.DefaultTransport))
+			require.NoError(t, err)
+
+			got := c.GetCaURL()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_enforceRequestID(t *testing.T) {
+	set := httptest.NewRequest(http.MethodGet, "https://example.com", http.NoBody)
+	set.Header.Set("X-Request-Id", "already-set")
+	inContext := httptest.NewRequest(http.MethodGet, "https://example.com", http.NoBody)
+	inContext = inContext.WithContext(client.NewRequestIDContext(inContext.Context(), "from-context"))
+	newRequestID := httptest.NewRequest(http.MethodGet, "https://example.com", http.NoBody)
+
+	tests := []struct {
+		name string
+		r    *http.Request
+		want string
+	}{
+		{
+			name: "set",
+			r:    set,
+			want: "already-set",
+		},
+		{
+			name: "context",
+			r:    inContext,
+			want: "from-context",
+		},
+		{
+			name: "new",
+			r:    newRequestID,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			enforceRequestID(tt.r)
+
+			v := tt.r.Header.Get("X-Request-Id")
+			if assert.NotEmpty(t, v) {
+				if tt.want != "" {
+					assert.Equal(t, tt.want, v)
 				}
 			}
 		})
 	}
+}
+
+func Test_newRequestID(t *testing.T) {
+	requestID := newRequestID()
+	u, err := uuid.Parse(requestID)
+	assert.NoError(t, err)
+	assert.Equal(t, uuid.Version(0x4), u.Version())
+	assert.Equal(t, uuid.RFC4122, u.Variant())
+	assert.Equal(t, requestID, u.String())
 }

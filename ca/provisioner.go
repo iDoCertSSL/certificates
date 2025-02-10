@@ -6,11 +6,13 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/smallstep/cli-utils/token"
+	"github.com/smallstep/cli-utils/token/provision"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/certificates/authority/provisioner"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
-	"github.com/smallstep/cli/token"
-	"github.com/smallstep/cli/token/provision"
 )
 
 const tokenLifetime = 5 * time.Minute
@@ -133,7 +135,7 @@ func (p *Provisioner) SSHToken(certType, keyID string, principals []string) (str
 		token.WithIssuer(p.name),
 		token.WithAudience(p.sshAudience),
 		token.WithValidity(notBefore, notAfter),
-		token.WithSSH(provisioner.SSHOptions{
+		token.WithSSH(provisioner.SignSSHOptions{
 			CertType:   certType,
 			Principals: principals,
 			KeyID:      keyID,
@@ -155,11 +157,11 @@ func (p *Provisioner) SSHToken(certType, keyID string, principals []string) (str
 func decryptProvisionerJWK(encryptedKey string, password []byte) (*jose.JSONWebKey, error) {
 	enc, err := jose.ParseEncrypted(encryptedKey)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error parsing provisioner encrypted key")
 	}
 	data, err := enc.Decrypt(password)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error decrypting provisioner key with provided password")
 	}
 	jwk := new(jose.JSONWebKey)
 	if err := json.Unmarshal(data, jwk); err != nil {
@@ -182,19 +184,17 @@ func loadProvisionerJWKByKid(client *Client, kid string, password []byte) (*jose
 // loadProvisionerJWKByName retrieves the list of provisioners and encrypted key then
 // returns the key of the first provisioner with a matching name that can be successfully
 // decrypted with the specified password.
-func loadProvisionerJWKByName(client *Client, name string, password []byte) (key *jose.JSONWebKey, err error) {
+func loadProvisionerJWKByName(client *Client, name string, password []byte) (*jose.JSONWebKey, error) {
 	provisioners, err := getProvisioners(client)
 	if err != nil {
-		err = errors.Wrap(err, "error getting the provisioners")
-		return
+		return nil, errors.Wrap(err, "error getting the provisioners")
 	}
 
 	for _, provisioner := range provisioners {
 		if provisioner.GetName() == name {
 			if _, encryptedKey, ok := provisioner.GetEncryptedKey(); ok {
-				key, err = decryptProvisionerJWK(encryptedKey, password)
-				if err == nil {
-					return
+				if key, err := decryptProvisionerJWK(encryptedKey, password); err == nil {
+					return key, nil
 				}
 			}
 		}

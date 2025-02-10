@@ -6,6 +6,10 @@
 *.so
 *.dylib
 
+# Go Workspaces
+go.work
+go.work.sum
+
 # Test binary, build with `go test -c`
 *.test
 
@@ -14,8 +18,14 @@
 
 # Others
 *.swp
-.travis-releases
+.releases
 coverage.txt
-vendor
 output
+vendor
+dist/
 .idea
+.envrc
+
+# Packages files
+0x889B19391F774443-Certify.key
+gha-creds-*.json

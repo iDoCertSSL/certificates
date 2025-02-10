@@ -14,6 +14,8 @@ type methodKey struct{}
 const (
 	// SignMethod is the method used to sign X.509 certificates.
 	SignMethod Method = iota
+	// SignIdentityMethod is the method used to sign X.509 identity certificates.
+	SignIdentityMethod
 	// RevokeMethod is the method used to revoke X.509 certificates.
 	RevokeMethod
 	// RenewMethod is the method used to renew X.509 certificates.
@@ -33,6 +35,8 @@ func (m Method) String() string {
 	switch m {
 	case SignMethod:
 		return "sign-method"
+	case SignIdentityMethod:
+		return "sign-identity-method"
 	case RevokeMethod:
 		return "revoke-method"
 	case RenewMethod:
@@ -56,9 +60,35 @@ func NewContextWithMethod(ctx context.Context, method Method) context.Context {
 	return context.WithValue(ctx, methodKey{}, method)
 }
 
-// MethodFromContext returns the Method saved in ctx. Returns Sign if the given
-// context has no Method associated with it.
+// MethodFromContext returns the Method saved in ctx.
 func MethodFromContext(ctx context.Context) Method {
 	m, _ := ctx.Value(methodKey{}).(Method)
 	return m
+}
+
+type tokenKey struct{}
+
+// NewContextWithToken creates a new context with the given token.
+func NewContextWithToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, tokenKey{}, token)
+}
+
+// TokenFromContext returns the token stored in the given context.
+func TokenFromContext(ctx context.Context) (string, bool) {
+	token, ok := ctx.Value(tokenKey{}).(string)
+	return token, ok
+}
+
+// The key to save the certTypeKey in the context.
+type certTypeKey struct{}
+
+// NewContextWithCertType creates a new context with the given CertType.
+func NewContextWithCertType(ctx context.Context, certType string) context.Context {
+	return context.WithValue(ctx, certTypeKey{}, certType)
+}
+
+// CertTypeFromContext returns the certType stored in the given context.
+func CertTypeFromContext(ctx context.Context) (string, bool) {
+	certType, ok := ctx.Value(certTypeKey{}).(string)
+	return certType, ok
 }

@@ -8,91 +8,92 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"io/ioutil"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority"
-	"github.com/smallstep/cli/crypto/randutil"
-	stepJOSE "github.com/smallstep/cli/jose"
-	jose "gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
-func generateOTT(subject string) string {
+func generateOTT(t *testing.T, subject string) string {
+	t.Helper()
 	now := time.Now()
-	jwk, err := stepJOSE.ParseKey("testdata/secrets/ott_mariano_priv.jwk", stepJOSE.WithPassword([]byte("password")))
-	if err != nil {
-		panic(err)
-	}
+	jwk, err := jose.ReadKey("testdata/secrets/ott_mariano_priv.jwk", jose.WithPassword([]byte("password")))
+	require.NoError(t, err)
+
 	opts := new(jose.SignerOptions).WithType("JWT").WithHeader("kid", jwk.KeyID)
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, opts)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
+
 	id, err := randutil.ASCII(64)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
+
 	cl := struct {
-		jwt.Claims
+		jose.Claims
 		SANS []string `json:"sans"`
 	}{
-		Claims: jwt.Claims{
+		Claims: jose.Claims{
 			ID:        id,
 			Subject:   subject,
 			Issuer:    "mariano",
-			NotBefore: jwt.NewNumericDate(now),
-			Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+			NotBefore: jose.NewNumericDate(now),
+			Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 			Audience:  []string{"https://127.0.0.1:0/sign"},
 		},
 		SANS: []string{subject},
 	}
-	raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
-	if err != nil {
-		panic(err)
-	}
+	raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+	require.NoError(t, err)
+
 	return raw
 }
 
-func startTestServer(tlsConfig *tls.Config, handler http.Handler) *httptest.Server {
+func startTestServer(baseContext context.Context, tlsConfig *tls.Config, handler http.Handler) *httptest.Server {
 	srv := httptest.NewUnstartedServer(handler)
 	srv.TLS = tlsConfig
+	// Base context MUST be set before the start of the server
+	srv.Config.BaseContext = func(l net.Listener) context.Context {
+		return baseContext
+	}
 	srv.StartTLS()
 	// Force the use of GetCertificate on IPs
 	srv.TLS.Certificates = nil
 	return srv
 }
 
-func startCATestServer() *httptest.Server {
+func startCATestServer(t *testing.T) *httptest.Server {
 	config, err := authority.LoadConfiguration("testdata/ca.json")
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
 	ca, err := New(config)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
 	// Use a httptest.Server instead
-	return startTestServer(ca.srv.TLSConfig, ca.srv.Handler)
+	baseContext := buildContext(ca.auth, nil, nil, nil)
+	srv := startTestServer(baseContext, ca.srv.TLSConfig, ca.srv.Handler)
+	return srv
 }
 
-func sign(domain string) (*Client, *api.SignResponse, crypto.PrivateKey) {
-	srv := startCATestServer()
+func sign(t *testing.T, domain string) (*Client, *api.SignResponse, crypto.PrivateKey) {
+	t.Helper()
+	srv := startCATestServer(t)
 	defer srv.Close()
-	return signDuration(srv, domain, 0)
+	return signDuration(t, srv, domain, 0)
 }
 
-func signDuration(srv *httptest.Server, domain string, duration time.Duration) (*Client, *api.SignResponse, crypto.PrivateKey) {
-	req, pk, err := CreateSignRequest(generateOTT(domain))
-	if err != nil {
-		panic(err)
-	}
+func signDuration(t *testing.T, srv *httptest.Server, domain string, duration time.Duration) (*Client, *api.SignResponse, crypto.PrivateKey) {
+	t.Helper()
+	req, pk, err := CreateSignRequest(generateOTT(t, domain))
+	require.NoError(t, err)
 
 	if duration > 0 {
 		req.NotBefore = api.NewTimeDuration(time.Now())
@@ -100,13 +101,11 @@ func signDuration(srv *httptest.Server, domain string, duration time.Duration) (
 	}
 
 	client, err := NewClient(srv.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
+
 	sr, err := client.Sign(req)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
+
 	return client, sr, pk
 }
 
@@ -140,7 +139,7 @@ func serverHandler(t *testing.T, clientDomain string) http.Handler {
 
 func TestClient_GetServerTLSConfig_http(t *testing.T) {
 	clientDomain := "test.domain"
-	client, sr, pk := sign("127.0.0.1")
+	client, sr, pk := sign(t, "127.0.0.1")
 
 	// Create mTLS server
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,7 +148,7 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Client.GetServerTLSConfig() error = %v", err)
 	}
-	srvMTLS := startTestServer(tlsConfig, serverHandler(t, clientDomain))
+	srvMTLS := startTestServer(context.Background(), tlsConfig, serverHandler(t, clientDomain))
 	defer srvMTLS.Close()
 
 	// Create TLS server
@@ -159,7 +158,7 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Client.GetServerTLSConfig() error = %v", err)
 	}
-	srvTLS := startTestServer(tlsConfig, serverHandler(t, clientDomain))
+	srvTLS := startTestServer(context.Background(), tlsConfig, serverHandler(t, clientDomain))
 	defer srvTLS.Close()
 
 	tests := []struct {
@@ -183,13 +182,8 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 				t.Errorf("Client.GetClientTLSConfig() error = %v", err)
 				return nil
 			}
-			tr, err := getDefaultTransport(tlsConfig)
-			if err != nil {
-				t.Errorf("getDefaultTransport() error = %v", err)
-				return nil
-			}
 			return &http.Client{
-				Transport: tr,
+				Transport: getDefaultTransport(tlsConfig),
 			}
 		}, map[string]bool{srvTLS.URL: false, srvMTLS.URL: false}},
 		{"with no ClientCert", func(t *testing.T, client *Client, sr *api.SignResponse, pk crypto.PrivateKey) *http.Client {
@@ -201,14 +195,8 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 			tlsConfig := getDefaultTLSConfig(sr)
 			tlsConfig.RootCAs = x509.NewCertPool()
 			tlsConfig.RootCAs.AddCert(root)
-
-			tr, err := getDefaultTransport(tlsConfig)
-			if err != nil {
-				t.Errorf("getDefaultTransport() error = %v", err)
-				return nil
-			}
 			return &http.Client{
-				Transport: tr,
+				Transport: getDefaultTransport(tlsConfig),
 			}
 		}, map[string]bool{srvTLS.URL + "/no-cert": false, srvMTLS.URL + "/no-cert": true}},
 		{"fail with default", func(t *testing.T, client *Client, sr *api.SignResponse, pk crypto.PrivateKey) *http.Client {
@@ -218,7 +206,7 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, sr, pk := sign(clientDomain)
+			client, sr, pk := sign(t, clientDomain)
 			cli := tt.getClient(t, client, sr, pk)
 			if cli == nil {
 				return
@@ -234,9 +222,9 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 						return
 					}
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						t.Fatalf("ioutil.RealAdd() error = %v", err)
+						t.Fatalf("io.ReadAll() error = %v", err)
 					}
 					if !bytes.Equal(b, []byte("ok")) {
 						t.Errorf("response body unexpected, got %s, want ok", b)
@@ -252,60 +240,49 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 	defer reset()
 
 	// Start CA
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	clientDomain := "test.domain"
-	client, sr, pk := signDuration(ca, "127.0.0.1", 5*time.Second)
+	client, sr, pk := signDuration(t, ca, "127.0.0.1", 5*time.Second)
 
 	// Start mTLS server
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tlsConfig, err := client.GetServerTLSConfig(ctx, sr, pk)
-	if err != nil {
-		t.Fatalf("Client.GetServerTLSConfig() error = %v", err)
-	}
-	srvMTLS := startTestServer(tlsConfig, serverHandler(t, clientDomain))
+	require.NoError(t, err)
+
+	srvMTLS := startTestServer(context.Background(), tlsConfig, serverHandler(t, clientDomain))
 	defer srvMTLS.Close()
 
 	// Start TLS server
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 	tlsConfig, err = client.GetServerTLSConfig(ctx, sr, pk, VerifyClientCertIfGiven())
-	if err != nil {
-		t.Fatalf("Client.GetServerTLSConfig() error = %v", err)
-	}
-	srvTLS := startTestServer(tlsConfig, serverHandler(t, clientDomain))
+	require.NoError(t, err)
+
+	srvTLS := startTestServer(context.Background(), tlsConfig, serverHandler(t, clientDomain))
 	defer srvTLS.Close()
 
 	// Transport
-	client, sr, pk = signDuration(ca, clientDomain, 5*time.Second)
+	client, sr, pk = signDuration(t, ca, clientDomain, 5*time.Second)
 	tr1, err := client.Transport(context.Background(), sr, pk)
-	if err != nil {
-		t.Fatalf("Client.Transport() error = %v", err)
-	}
+	require.NoError(t, err)
+
 	// Transport with tlsConfig
-	client, sr, pk = signDuration(ca, clientDomain, 5*time.Second)
+	client, sr, pk = signDuration(t, ca, clientDomain, 5*time.Second)
 	tlsConfig, err = client.GetClientTLSConfig(context.Background(), sr, pk)
-	if err != nil {
-		t.Fatalf("Client.GetClientTLSConfig() error = %v", err)
-	}
-	tr2, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		t.Fatalf("getDefaultTransport() error = %v", err)
-	}
+	require.NoError(t, err)
+
+	tr2 := getDefaultTransport(tlsConfig)
 	// No client cert
 	root, err := RootCertificate(sr)
-	if err != nil {
-		t.Fatalf("RootCertificate() error = %v", err)
-	}
+	require.NoError(t, err)
+
 	tlsConfig = getDefaultTLSConfig(sr)
 	tlsConfig.RootCAs = x509.NewCertPool()
 	tlsConfig.RootCAs.AddCert(root)
-	tr3, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		t.Fatalf("getDefaultTransport() error = %v", err)
-	}
+	tr3 := getDefaultTransport(tlsConfig)
 
 	// Disable keep alives to force TLS handshake
 	tr1.DisableKeepAlives = true
@@ -354,9 +331,9 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 					}
 
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						t.Errorf("ioutil.RealAdd() error = %v", err)
+						t.Errorf("io.ReadAll() error = %v", err)
 						return
 					}
 					if !bytes.Equal(b, []byte("ok")) {
@@ -393,9 +370,9 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 					}
 
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						t.Errorf("ioutil.RealAdd() error = %v", err)
+						t.Errorf("io.ReadAll() error = %v", err)
 						return
 					}
 					if !bytes.Equal(b, []byte("ok")) {
@@ -413,13 +390,13 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 }
 
 func TestCertificate(t *testing.T) {
-	cert := parseCertificate(certPEM)
+	cert := parseCertificate(t, certPEM)
 	ok := &api.SignResponse{
 		ServerPEM: api.Certificate{Certificate: cert},
-		CaPEM:     api.Certificate{Certificate: parseCertificate(rootPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 		CertChainPEM: []api.Certificate{
 			{Certificate: cert},
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 	tests := []struct {
@@ -446,12 +423,12 @@ func TestCertificate(t *testing.T) {
 }
 
 func TestIntermediateCertificate(t *testing.T) {
-	intermediate := parseCertificate(rootPEM)
+	intermediate := parseCertificate(t, rootPEM)
 	ok := &api.SignResponse{
-		ServerPEM: api.Certificate{Certificate: parseCertificate(certPEM)},
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
 		CaPEM:     api.Certificate{Certificate: intermediate},
 		CertChainPEM: []api.Certificate{
-			{Certificate: parseCertificate(certPEM)},
+			{Certificate: parseCertificate(t, certPEM)},
 			{Certificate: intermediate},
 		},
 	}
@@ -479,24 +456,24 @@ func TestIntermediateCertificate(t *testing.T) {
 }
 
 func TestRootCertificateCertificate(t *testing.T) {
-	root := parseCertificate(rootPEM)
+	root := parseCertificate(t, rootPEM)
 	ok := &api.SignResponse{
-		ServerPEM: api.Certificate{Certificate: parseCertificate(certPEM)},
-		CaPEM:     api.Certificate{Certificate: parseCertificate(rootPEM)},
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 		CertChainPEM: []api.Certificate{
-			{Certificate: parseCertificate(certPEM)},
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 		TLS: &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{
 			{root, root},
 		}},
 	}
 	noTLS := &api.SignResponse{
-		ServerPEM: api.Certificate{Certificate: parseCertificate(certPEM)},
-		CaPEM:     api.Certificate{Certificate: parseCertificate(rootPEM)},
+		ServerPEM: api.Certificate{Certificate: parseCertificate(t, certPEM)},
+		CaPEM:     api.Certificate{Certificate: parseCertificate(t, rootPEM)},
 		CertChainPEM: []api.Certificate{
-			{Certificate: parseCertificate(certPEM)},
-			{Certificate: parseCertificate(rootPEM)},
+			{Certificate: parseCertificate(t, certPEM)},
+			{Certificate: parseCertificate(t, rootPEM)},
 		},
 	}
 	tests := []struct {

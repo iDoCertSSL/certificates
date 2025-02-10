@@ -4,15 +4,18 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/smallstep/certificates/api"
 )
 
+//nolint:gosec // test tls config
 func Test_newTLSOptionCtx(t *testing.T) {
 	client, err := NewClient("https://ca.smallstep.com", WithTransport(http.DefaultTransport))
 	if err != nil {
@@ -40,6 +43,7 @@ func Test_newTLSOptionCtx(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestTLSOptionCtx_apply(t *testing.T) {
 	fail := func() TLSOption {
 		return func(ctx *TLSOptionCtx) error {
@@ -76,6 +80,7 @@ func TestTLSOptionCtx_apply(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestRequireAndVerifyClientCert(t *testing.T) {
 	tests := []struct {
 		name string
@@ -100,6 +105,7 @@ func TestRequireAndVerifyClientCert(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestVerifyClientCertIfGiven(t *testing.T) {
 	tests := []struct {
 		name string
@@ -124,8 +130,9 @@ func TestVerifyClientCertIfGiven(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddRootCA(t *testing.T) {
-	cert := parseCertificate(rootPEM)
+	cert := parseCertificate(t, rootPEM)
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 
@@ -149,15 +156,16 @@ func TestAddRootCA(t *testing.T) {
 				t.Errorf("AddRootCA() error = %v", err)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config, tt.want) {
+			if !reflect.DeepEqual(ctx.Config, tt.want) && !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) {
 				t.Errorf("AddRootCA() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddClientCA(t *testing.T) {
-	cert := parseCertificate(rootPEM)
+	cert := parseCertificate(t, rootPEM)
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 
@@ -181,33 +189,28 @@ func TestAddClientCA(t *testing.T) {
 				t.Errorf("AddClientCA() error = %v", err)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config, tt.want) {
+			if !reflect.DeepEqual(ctx.Config, tt.want) && !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddClientCA() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddRootsToRootCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	cert := parseCertificate(string(root))
+	cert := parseCertificate(t, string(root))
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 
@@ -235,33 +238,28 @@ func TestAddRootsToRootCAs(t *testing.T) {
 				t.Errorf("AddRootsToRootCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.RootCAs, tt.want.RootCAs) {
+			if !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) {
 				t.Errorf("AddRootsToRootCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddRootsToClientCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	cert := parseCertificate(string(root))
+	cert := parseCertificate(t, string(root))
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 
@@ -289,39 +287,32 @@ func TestAddRootsToClientCAs(t *testing.T) {
 				t.Errorf("AddRootsToClientCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.ClientCAs, tt.want.ClientCAs) {
+			if !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddRootsToClientCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddFederationToRootCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
+	require.NoError(t, err)
 
-	crt1 := parseCertificate(string(root))
-	crt2 := parseCertificate(string(federated))
+	crt1 := parseCertificate(t, string(root))
+	crt2 := parseCertificate(t, string(federated))
 	pool := x509.NewCertPool()
 	pool.AddCert(crt1)
 	pool.AddCert(crt2)
@@ -360,32 +351,25 @@ func TestAddFederationToRootCAs(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddFederationToClientCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
+	require.NoError(t, err)
 
-	crt1 := parseCertificate(string(root))
-	crt2 := parseCertificate(string(federated))
+	crt1 := parseCertificate(t, string(root))
+	crt2 := parseCertificate(t, string(federated))
 	pool := x509.NewCertPool()
 	pool.AddCert(crt1)
 	pool.AddCert(crt2)
@@ -424,26 +408,21 @@ func TestAddFederationToClientCAs(t *testing.T) {
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddRootsToCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	cert := parseCertificate(string(root))
+	cert := parseCertificate(t, string(root))
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 
@@ -471,39 +450,32 @@ func TestAddRootsToCAs(t *testing.T) {
 				t.Errorf("AddRootsToCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.RootCAs, tt.want.RootCAs) || !reflect.DeepEqual(ctx.Config.ClientCAs, tt.want.ClientCAs) {
+			if !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) || !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddRootsToCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
 	}
 }
 
+//nolint:gosec // test tls config
 func TestAddFederationToCAs(t *testing.T) {
-	ca := startCATestServer()
+	ca := startCATestServer(t)
 	defer ca.Close()
 
 	client, err := NewClient(ca.URL, WithRootFile("testdata/secrets/root_ca.crt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	clientFail, err := NewClient(ca.URL, WithTransport(http.DefaultTransport))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
+	require.NoError(t, err)
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
+	require.NoError(t, err)
 
-	crt1 := parseCertificate(string(root))
-	crt2 := parseCertificate(string(federated))
+	crt1 := parseCertificate(t, string(root))
+	crt2 := parseCertificate(t, string(federated))
 	pool := x509.NewCertPool()
 	pool.AddCert(crt1)
 	pool.AddCert(crt2)
@@ -542,7 +514,11 @@ func TestAddFederationToCAs(t *testing.T) {
 	}
 }
 
+//nolint:staticcheck,gocritic
 func equalPools(a, b *x509.CertPool) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
 	subjects := a.Subjects()
 	sA := make([]string, len(subjects))
 	for i := range subjects {

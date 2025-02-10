@@ -10,20 +10,22 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/smallstep/assert"
+	"github.com/google/uuid"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/logging"
-	"github.com/smallstep/certificates/sshutil"
 	"github.com/smallstep/certificates/templates"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -123,9 +125,9 @@ func getSignedHostCertificate() (*ssh.Certificate, error) {
 
 func TestSSHCertificate_MarshalJSON(t *testing.T) {
 	user, err := getSignedUserCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	host, err := getSignedHostCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userB64 := base64.StdEncoding.EncodeToString(user.Marshal())
 	hostB64 := base64.StdEncoding.EncodeToString(host.Marshal())
 
@@ -161,9 +163,9 @@ func TestSSHCertificate_MarshalJSON(t *testing.T) {
 
 func TestSSHCertificate_UnmarshalJSON(t *testing.T) {
 	user, err := getSignedUserCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	host, err := getSignedHostCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userB64 := base64.StdEncoding.EncodeToString(user.Marshal())
 	hostB64 := base64.StdEncoding.EncodeToString(host.Marshal())
 	keyB64 := base64.StdEncoding.EncodeToString(user.Key.Marshal())
@@ -251,11 +253,11 @@ func TestSignSSHRequest_Validate(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHSign(t *testing.T) {
+func Test_SSHSign(t *testing.T) {
 	user, err := getSignedUserCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	host, err := getSignedHostCertificate()
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 
 	userB64 := base64.StdEncoding.EncodeToString(user.Marshal())
 	hostB64 := base64.StdEncoding.EncodeToString(host.Marshal())
@@ -264,28 +266,28 @@ func Test_caHandler_SSHSign(t *testing.T) {
 		PublicKey: user.Key.Marshal(),
 		OTT:       "ott",
 	})
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	hostReq, err := json.Marshal(SSHSignRequest{
 		PublicKey: host.Key.Marshal(),
 		OTT:       "ott",
 	})
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userAddReq, err := json.Marshal(SSHSignRequest{
 		PublicKey:        user.Key.Marshal(),
 		OTT:              "ott",
 		AddUserPublicKey: user.Key.Marshal(),
 	})
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userIdentityReq, err := json.Marshal(SSHSignRequest{
 		PublicKey:   user.Key.Marshal(),
 		OTT:         "ott",
 		IdentityCSR: CertificateRequest{parseCertificateRequest(csrPEM)},
 	})
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	identityCerts := []*x509.Certificate{
 		parseCertificate(certPEM),
 	}
-	identityCertsPEM := []byte(`"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n"`)
+	identityCertsPEM := []byte(`"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n"`)
 
 	tests := []struct {
 		name         string
@@ -300,14 +302,14 @@ func Test_caHandler_SSHSign(t *testing.T) {
 		body         []byte
 		statusCode   int
 	}{
-		{"ok-user", userReq, nil, user, nil, nil, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":"%s"}`, userB64)), http.StatusCreated},
-		{"ok-host", hostReq, nil, host, nil, nil, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":"%s"}`, hostB64)), http.StatusCreated},
-		{"ok-user-add", userAddReq, nil, user, nil, user, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":"%s","addUserCrt":"%s"}`, userB64, userB64)), http.StatusCreated},
-		{"ok-user-identity", userIdentityReq, nil, user, nil, user, nil, identityCerts, nil, []byte(fmt.Sprintf(`{"crt":"%s","identityCrt":[%s]}`, userB64, identityCertsPEM)), http.StatusCreated},
+		{"ok-user", userReq, nil, user, nil, nil, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":%q}`, userB64)), http.StatusCreated},
+		{"ok-host", hostReq, nil, host, nil, nil, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":%q}`, hostB64)), http.StatusCreated},
+		{"ok-user-add", userAddReq, nil, user, nil, user, nil, nil, nil, []byte(fmt.Sprintf(`{"crt":%q,"addUserCrt":%q}`, userB64, userB64)), http.StatusCreated},
+		{"ok-user-identity", userIdentityReq, nil, user, nil, user, nil, identityCerts, nil, []byte(fmt.Sprintf(`{"crt":%q,"identityCrt":[%s]}`, userB64, identityCertsPEM)), http.StatusCreated},
 		{"fail-body", []byte("bad-json"), nil, nil, nil, nil, nil, nil, nil, nil, http.StatusBadRequest},
 		{"fail-validate", []byte("{}"), nil, nil, nil, nil, nil, nil, nil, nil, http.StatusBadRequest},
 		{"fail-publicKey", []byte(`{"publicKey":"Zm9v","ott":"ott"}`), nil, nil, nil, nil, nil, nil, nil, nil, http.StatusBadRequest},
-		{"fail-publicKey", []byte(fmt.Sprintf(`{"publicKey":"%s","ott":"ott","addUserPublicKey":"Zm9v"}`, base64.StdEncoding.EncodeToString(user.Key.Marshal()))), nil, nil, nil, nil, nil, nil, nil, nil, http.StatusBadRequest},
+		{"fail-publicKey", []byte(fmt.Sprintf(`{"publicKey":%q,"ott":"ott","addUserPublicKey":"Zm9v"}`, base64.StdEncoding.EncodeToString(user.Key.Marshal()))), nil, nil, nil, nil, nil, nil, nil, nil, http.StatusBadRequest},
 		{"fail-authorize", userReq, fmt.Errorf("an-error"), nil, nil, nil, nil, nil, nil, nil, http.StatusUnauthorized},
 		{"fail-signSSH", userReq, nil, nil, fmt.Errorf("an-error"), nil, nil, nil, nil, nil, http.StatusForbidden},
 		{"fail-SignSSHAddUser", userAddReq, nil, user, nil, nil, fmt.Errorf("an-error"), nil, nil, nil, http.StatusForbidden},
@@ -315,31 +317,31 @@ func Test_caHandler_SSHSign(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+			mockMustAuthority(t, &mockAuthority{
+				authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 					return []provisioner.SignOption{}, tt.authErr
 				},
-				signSSH: func(key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+				signSSH: func(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
 					return tt.signCert, tt.signErr
 				},
-				signSSHAddUser: func(key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
+				signSSHAddUser: func(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
 					return tt.addUserCert, tt.addUserErr
 				},
-				sign: func(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
+				signWithContext: func(ctx context.Context, cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
 					return tt.tlsSignCerts, tt.tlsSignErr
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("POST", "http://example.com/ssh/sign", bytes.NewReader(tt.req))
 			w := httptest.NewRecorder()
-			h.SSHSign(logging.NewResponseLogger(w), req)
+			SSHSign(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SignSSH StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SignSSH unexpected error = %v", err)
@@ -353,13 +355,13 @@ func Test_caHandler_SSHSign(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHRoots(t *testing.T) {
+func Test_SSHRoots(t *testing.T) {
 	user, err := ssh.NewPublicKey(sshUserKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userB64 := base64.StdEncoding.EncodeToString(user.Marshal())
 
 	host, err := ssh.NewPublicKey(sshHostKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	hostB64 := base64.StdEncoding.EncodeToString(host.Marshal())
 
 	tests := []struct {
@@ -369,31 +371,31 @@ func Test_caHandler_SSHRoots(t *testing.T) {
 		body       []byte
 		statusCode int
 	}{
-		{"ok", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}, UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s"],"hostKey":["%s"]}`, userB64, hostB64)), http.StatusOK},
-		{"many", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host, host}, UserKeys: []ssh.PublicKey{user, user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s","%s"],"hostKey":["%s","%s"]}`, userB64, userB64, hostB64, hostB64)), http.StatusOK},
-		{"user", &authority.SSHKeys{UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s"]}`, userB64)), http.StatusOK},
-		{"host", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}}, nil, []byte(fmt.Sprintf(`{"hostKey":["%s"]}`, hostB64)), http.StatusOK},
+		{"ok", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}, UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q],"hostKey":[%q]}`, userB64, hostB64)), http.StatusOK},
+		{"many", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host, host}, UserKeys: []ssh.PublicKey{user, user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q,%q],"hostKey":[%q,%q]}`, userB64, userB64, hostB64, hostB64)), http.StatusOK},
+		{"user", &authority.SSHKeys{UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q]}`, userB64)), http.StatusOK},
+		{"host", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}}, nil, []byte(fmt.Sprintf(`{"hostKey":[%q]}`, hostB64)), http.StatusOK},
 		{"empty", &authority.SSHKeys{}, nil, nil, http.StatusNotFound},
 		{"error", nil, fmt.Errorf("an error"), nil, http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				getSSHRoots: func() (*authority.SSHKeys, error) {
+			mockMustAuthority(t, &mockAuthority{
+				getSSHRoots: func(ctx context.Context) (*authority.SSHKeys, error) {
 					return tt.keys, tt.keysErr
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("GET", "http://example.com/ssh/roots", http.NoBody)
 			w := httptest.NewRecorder()
-			h.SSHRoots(logging.NewResponseLogger(w), req)
+			SSHRoots(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHRoots StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHRoots unexpected error = %v", err)
@@ -407,13 +409,13 @@ func Test_caHandler_SSHRoots(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHFederation(t *testing.T) {
+func Test_SSHFederation(t *testing.T) {
 	user, err := ssh.NewPublicKey(sshUserKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	userB64 := base64.StdEncoding.EncodeToString(user.Marshal())
 
 	host, err := ssh.NewPublicKey(sshHostKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	hostB64 := base64.StdEncoding.EncodeToString(host.Marshal())
 
 	tests := []struct {
@@ -423,31 +425,31 @@ func Test_caHandler_SSHFederation(t *testing.T) {
 		body       []byte
 		statusCode int
 	}{
-		{"ok", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}, UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s"],"hostKey":["%s"]}`, userB64, hostB64)), http.StatusOK},
-		{"many", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host, host}, UserKeys: []ssh.PublicKey{user, user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s","%s"],"hostKey":["%s","%s"]}`, userB64, userB64, hostB64, hostB64)), http.StatusOK},
-		{"user", &authority.SSHKeys{UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":["%s"]}`, userB64)), http.StatusOK},
-		{"host", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}}, nil, []byte(fmt.Sprintf(`{"hostKey":["%s"]}`, hostB64)), http.StatusOK},
+		{"ok", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}, UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q],"hostKey":[%q]}`, userB64, hostB64)), http.StatusOK},
+		{"many", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host, host}, UserKeys: []ssh.PublicKey{user, user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q,%q],"hostKey":[%q,%q]}`, userB64, userB64, hostB64, hostB64)), http.StatusOK},
+		{"user", &authority.SSHKeys{UserKeys: []ssh.PublicKey{user}}, nil, []byte(fmt.Sprintf(`{"userKey":[%q]}`, userB64)), http.StatusOK},
+		{"host", &authority.SSHKeys{HostKeys: []ssh.PublicKey{host}}, nil, []byte(fmt.Sprintf(`{"hostKey":[%q]}`, hostB64)), http.StatusOK},
 		{"empty", &authority.SSHKeys{}, nil, nil, http.StatusNotFound},
 		{"error", nil, fmt.Errorf("an error"), nil, http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				getSSHFederation: func() (*authority.SSHKeys, error) {
+			mockMustAuthority(t, &mockAuthority{
+				getSSHFederation: func(ctx context.Context) (*authority.SSHKeys, error) {
 					return tt.keys, tt.keysErr
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("GET", "http://example.com/ssh/federation", http.NoBody)
 			w := httptest.NewRecorder()
-			h.SSHFederation(logging.NewResponseLogger(w), req)
+			SSHFederation(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHFederation StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHFederation unexpected error = %v", err)
@@ -461,7 +463,7 @@ func Test_caHandler_SSHFederation(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHConfig(t *testing.T) {
+func Test_SSHConfig(t *testing.T) {
 	userOutput := []templates.Output{
 		{Name: "config.tpl", Type: templates.File, Comment: "#", Path: "ssh/config", Content: []byte("UserKnownHostsFile /home/user/.step/ssh/known_hosts")},
 		{Name: "known_host.tpl", Type: templates.File, Comment: "#", Path: "ssh/known_host", Content: []byte("@cert-authority * ecdsa-sha2-nistp256 AAAA...=")},
@@ -471,9 +473,9 @@ func Test_caHandler_SSHConfig(t *testing.T) {
 		{Name: "ca.tpl", Type: templates.File, Comment: "#", Path: "/etc/ssh/ca.pub", Content: []byte("ecdsa-sha2-nistp256 AAAA...=")},
 	}
 	userJSON, err := json.Marshal(userOutput)
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	hostJSON, err := json.Marshal(hostOutput)
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 
 	tests := []struct {
 		name       string
@@ -492,22 +494,22 @@ func Test_caHandler_SSHConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				getSSHConfig: func(typ string, data map[string]string) ([]templates.Output, error) {
+			mockMustAuthority(t, &mockAuthority{
+				getSSHConfig: func(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error) {
 					return tt.output, tt.err
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("GET", "http://example.com/ssh/config", strings.NewReader(tt.req))
 			w := httptest.NewRecorder()
-			h.SSHConfig(logging.NewResponseLogger(w), req)
+			SSHConfig(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHConfig StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHConfig unexpected error = %v", err)
@@ -521,7 +523,7 @@ func Test_caHandler_SSHConfig(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHCheckHost(t *testing.T) {
+func Test_SSHCheckHost(t *testing.T) {
 	tests := []struct {
 		name       string
 		req        string
@@ -539,22 +541,22 @@ func Test_caHandler_SSHCheckHost(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
+			mockMustAuthority(t, &mockAuthority{
 				checkSSHHost: func(ctx context.Context, principal, token string) (bool, error) {
 					return tt.exists, tt.err
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("GET", "http://example.com/ssh/check-host", strings.NewReader(tt.req))
 			w := httptest.NewRecorder()
-			h.SSHCheckHost(logging.NewResponseLogger(w), req)
+			SSHCheckHost(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHCheckHost StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHCheckHost unexpected error = %v", err)
@@ -568,44 +570,44 @@ func Test_caHandler_SSHCheckHost(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHGetHosts(t *testing.T) {
-	hosts := []sshutil.Host{
-		{HostID: "1", HostGroups: []sshutil.HostGroup{{ID: "1", Name: "group 1"}}, Hostname: "host1"},
-		{HostID: "2", HostGroups: []sshutil.HostGroup{{ID: "1", Name: "group 1"}, {ID: "2", Name: "group 2"}}, Hostname: "host2"},
+func Test_SSHGetHosts(t *testing.T) {
+	hosts := []authority.Host{
+		{HostID: "1", HostTags: []authority.HostTag{{ID: "1", Name: "group", Value: "1"}}, Hostname: "host1"},
+		{HostID: "2", HostTags: []authority.HostTag{{ID: "1", Name: "group", Value: "1"}, {ID: "2", Name: "group", Value: "2"}}, Hostname: "host2"},
 	}
 	hostsJSON, err := json.Marshal(hosts)
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 
 	tests := []struct {
 		name       string
-		hosts      []sshutil.Host
+		hosts      []authority.Host
 		err        error
 		body       []byte
 		statusCode int
 	}{
 		{"ok", hosts, nil, []byte(fmt.Sprintf(`{"hosts":%s}`, hostsJSON)), http.StatusOK},
-		{"empty (array)", []sshutil.Host{}, nil, []byte(`{"hosts":[]}`), http.StatusOK},
+		{"empty (array)", []authority.Host{}, nil, []byte(`{"hosts":[]}`), http.StatusOK},
 		{"empty (nil)", nil, nil, []byte(`{"hosts":null}`), http.StatusOK},
 		{"error", nil, fmt.Errorf("an error"), nil, http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				getSSHHosts: func(*x509.Certificate) ([]sshutil.Host, error) {
+			mockMustAuthority(t, &mockAuthority{
+				getSSHHosts: func(context.Context, *x509.Certificate) ([]authority.Host, error) {
 					return tt.hosts, tt.err
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("GET", "http://example.com/ssh/host", http.NoBody)
 			w := httptest.NewRecorder()
-			h.SSHGetHosts(logging.NewResponseLogger(w), req)
+			SSHGetHosts(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHGetHosts StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHGetHosts unexpected error = %v", err)
@@ -619,7 +621,7 @@ func Test_caHandler_SSHGetHosts(t *testing.T) {
 	}
 }
 
-func Test_caHandler_SSHBastion(t *testing.T) {
+func Test_SSHBastion(t *testing.T) {
 	bastion := &authority.Bastion{
 		Hostname: "bastion.local",
 	}
@@ -645,22 +647,22 @@ func Test_caHandler_SSHBastion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
-				getSSHBastion: func(user, hostname string) (*authority.Bastion, error) {
+			mockMustAuthority(t, &mockAuthority{
+				getSSHBastion: func(ctx context.Context, user, hostname string) (*authority.Bastion, error) {
 					return tt.bastion, tt.bastionErr
 				},
-			}).(*caHandler)
+			})
 
 			req := httptest.NewRequest("POST", "http://example.com/ssh/bastion", bytes.NewReader(tt.req))
 			w := httptest.NewRecorder()
-			h.SSHBastion(logging.NewResponseLogger(w), req)
+			SSHBastion(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.SSHBastion StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.SSHBastion unexpected error = %v", err)
@@ -676,7 +678,7 @@ func Test_caHandler_SSHBastion(t *testing.T) {
 
 func TestSSHPublicKey_MarshalJSON(t *testing.T) {
 	key, err := ssh.NewPublicKey(sshUserKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	keyB64 := base64.StdEncoding.EncodeToString(key.Marshal())
 
 	tests := []struct {
@@ -705,7 +707,7 @@ func TestSSHPublicKey_MarshalJSON(t *testing.T) {
 
 func TestSSHPublicKey_UnmarshalJSON(t *testing.T) {
 	key, err := ssh.NewPublicKey(sshUserKey.Public())
-	assert.FatalError(t, err)
+	require.NoError(t, err)
 	keyB64 := base64.StdEncoding.EncodeToString(key.Marshal())
 
 	type args struct {
@@ -733,6 +735,101 @@ func TestSSHPublicKey_UnmarshalJSON(t *testing.T) {
 			if !reflect.DeepEqual(p, tt.want) {
 				t.Errorf("SSHPublicKey.UnmarshalJSON() = %v, want %v", p, tt.want)
 			}
+		})
+	}
+}
+
+func Test_identityModifier_Enforce(t *testing.T) {
+	now := time.Now()
+	type fields struct {
+		Identity  *url.URL
+		NotBefore time.Time
+		NotAfter  time.Time
+	}
+	type args struct {
+		cert *x509.Certificate
+	}
+	tests := []struct {
+		name      string
+		fields    fields
+		args      args
+		want      *x509.Certificate
+		assertion assert.ErrorAssertionFunc
+	}{
+		{"ok", fields{&url.URL{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}, now, now.Add(time.Hour)},
+			args{&x509.Certificate{}}, &x509.Certificate{
+				NotBefore: now,
+				NotAfter:  now.Add(time.Hour),
+				URIs:      []*url.URL{{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}},
+			}, assert.NoError},
+		{"ok exists", fields{&url.URL{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}, now, now.Add(time.Hour)},
+			args{&x509.Certificate{
+				URIs: []*url.URL{{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}},
+			}}, &x509.Certificate{
+				NotBefore: now,
+				NotAfter:  now.Add(time.Hour),
+				URIs:      []*url.URL{{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}},
+			}, assert.NoError},
+		{"ok append", fields{&url.URL{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"}, now, now.Add(time.Hour)},
+			args{&x509.Certificate{
+				URIs: []*url.URL{{Scheme: "urn", Opaque: "uuid:27bb66db-e12a-4ff6-9161-aa6b0a98f914"}},
+			}}, &x509.Certificate{
+				NotBefore: now,
+				NotAfter:  now.Add(time.Hour),
+				URIs: []*url.URL{
+					{Scheme: "urn", Opaque: "uuid:27bb66db-e12a-4ff6-9161-aa6b0a98f914"},
+					{Scheme: "urn", Opaque: "uuid:0c4670b2-d9f1-42bb-9045-184836f16733"},
+				},
+			}, assert.NoError},
+		{"ok no identity", fields{nil, now, now.Add(time.Hour)},
+			args{&x509.Certificate{}}, &x509.Certificate{
+				NotBefore: now,
+				NotAfter:  now.Add(time.Hour),
+			}, assert.NoError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &identityModifier{
+				Identity:  tt.fields.Identity,
+				NotBefore: tt.fields.NotBefore,
+				NotAfter:  tt.fields.NotAfter,
+			}
+			tt.assertion(t, m.Enforce(tt.args.cert))
+		})
+	}
+}
+
+func Test_getIdentityURI(t *testing.T) {
+	id, err := uuid.Parse("54a2ec9d-a7d9-4b53-8f9a-efcd275e35e1")
+	require.NoError(t, err)
+	u, err := url.Parse(id.URN())
+	require.NoError(t, err)
+
+	type args struct {
+		cr *x509.CertificateRequest
+	}
+	tests := []struct {
+		name string
+		args args
+		want *url.URL
+	}{
+		{"ok", args{&x509.CertificateRequest{
+			URIs: []*url.URL{u},
+		}}, &url.URL{Scheme: "urn", Opaque: "uuid:54a2ec9d-a7d9-4b53-8f9a-efcd275e35e1"}},
+		{"ok multiple", args{&x509.CertificateRequest{
+			URIs: []*url.URL{u, {Scheme: "urn", Opaque: "uuid:f0e74f3a-95fe-4cf6-98e3-68e55b69ba48"}},
+		}}, &url.URL{Scheme: "urn", Opaque: "uuid:54a2ec9d-a7d9-4b53-8f9a-efcd275e35e1"}},
+		{"ok multiple with invalid", args{&x509.CertificateRequest{
+			URIs: []*url.URL{{Scheme: "urn", Opaque: "uuid:f0e74f3a+95fe+4cf6+98e3+68e55b69ba48"}, u},
+		}}, &url.URL{Scheme: "urn", Opaque: "uuid:54a2ec9d-a7d9-4b53-8f9a-efcd275e35e1"}},
+		{"ok missing", args{&x509.CertificateRequest{
+			URIs: []*url.URL{{Scheme: "https", Host: "example.com", Path: "/54a2ec9d-a7d9-4b53-8f9a-efcd275e35e1"}},
+		}}, nil},
+		{"ok empty", args{&x509.CertificateRequest{}}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, getIdentityURI(tt.args.cr))
 		})
 	}
 }

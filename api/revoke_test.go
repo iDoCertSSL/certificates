@@ -6,13 +6,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/pkg/errors"
+
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
@@ -30,9 +31,13 @@ func TestRevokeRequestValidate(t *testing.T) {
 			rr:  &RevokeRequest{},
 			err: &errs.Error{Err: errors.New("missing serial"), Status: http.StatusBadRequest},
 		},
+		"error/bad sn": {
+			rr:  &RevokeRequest{Serial: "sn"},
+			err: &errs.Error{Err: errors.New("'sn' is not a valid serial number - use a base 10 representation or a base 16 representation with '0x' prefix"), Status: http.StatusBadRequest},
+		},
 		"error/bad reasonCode": {
 			rr: &RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 15,
 				Passive:    true,
 			},
@@ -40,7 +45,7 @@ func TestRevokeRequestValidate(t *testing.T) {
 		},
 		"error/non-passive not implemented": {
 			rr: &RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 8,
 				Passive:    false,
 			},
@@ -48,7 +53,7 @@ func TestRevokeRequestValidate(t *testing.T) {
 		},
 		"ok": {
 			rr: &RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 9,
 				Passive:    true,
 			},
@@ -57,12 +62,12 @@ func TestRevokeRequestValidate(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			if err := tc.rr.Validate(); err != nil {
-				switch v := err.(type) {
-				case *errs.Error:
-					assert.HasPrefix(t, v.Error(), tc.err.Error())
-					assert.Equals(t, v.StatusCode(), tc.err.Status)
-				default:
-					t.Errorf("unexpected error type: %T", v)
+				var ee *errs.Error
+				if errors.As(err, &ee) {
+					assert.HasPrefix(t, ee.Error(), tc.err.Error())
+					assert.Equals(t, ee.StatusCode(), tc.err.Status)
+				} else {
+					t.Errorf("unexpected error type: %T", err)
 				}
 			} else {
 				assert.Nil(t, tc.err)
@@ -96,7 +101,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 		},
 		"200/ott": func(t *testing.T) test {
 			input, err := json.Marshal(RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 4,
 				Reason:     "foo",
 				OTT:        "valid",
@@ -107,13 +112,13 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusOK,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
 						assert.True(t, opts.PassiveOnly)
 						assert.False(t, opts.MTLS)
-						assert.Equals(t, opts.Serial, "sn")
+						assert.Equals(t, opts.Serial, "10")
 						assert.Equals(t, opts.ReasonCode, 4)
 						assert.Equals(t, opts.Reason, "foo")
 						return nil
@@ -124,7 +129,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 		},
 		"400/no OTT and no peer certificate": func(t *testing.T) test {
 			input, err := json.Marshal(RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 4,
 				Passive:    true,
 			})
@@ -151,7 +156,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				statusCode: http.StatusOK,
 				tls:        cs,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, ri *authority.RevokeOptions) error {
@@ -175,7 +180,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 		},
 		"500/ott authority.Revoke": func(t *testing.T) test {
 			input, err := json.Marshal(RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 4,
 				Reason:     "foo",
 				OTT:        "valid",
@@ -186,7 +191,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusInternalServerError,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
@@ -197,7 +202,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 		},
 		"403/ott authority.Revoke": func(t *testing.T) test {
 			input, err := json.Marshal(RevokeRequest{
-				Serial:     "sn",
+				Serial:     "10",
 				ReasonCode: 4,
 				Reason:     "foo",
 				OTT:        "valid",
@@ -208,7 +213,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusForbidden,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
@@ -222,18 +227,18 @@ func Test_caHandler_Revoke(t *testing.T) {
 	for name, _tc := range tests {
 		tc := _tc(t)
 		t.Run(name, func(t *testing.T) {
-			h := New(tc.auth).(*caHandler)
+			mockMustAuthority(t, tc.auth)
 			req := httptest.NewRequest("POST", "http://example.com/revoke", strings.NewReader(tc.input))
 			if tc.tls != nil {
 				req.TLS = tc.tls
 			}
 			w := httptest.NewRecorder()
-			h.Revoke(logging.NewResponseLogger(w), req)
+			Revoke(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			assert.Equals(t, tc.statusCode, res.StatusCode)
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			assert.FatalError(t, err)
 

@@ -10,10 +10,10 @@ import (
 // Claims so that individual provisioners can override global claims.
 type Claims struct {
 	// TLS CA properties
-	MinTLSDur      *Duration `json:"minTLSCertDuration,omitempty"`
-	MaxTLSDur      *Duration `json:"maxTLSCertDuration,omitempty"`
-	DefaultTLSDur  *Duration `json:"defaultTLSCertDuration,omitempty"`
-	DisableRenewal *bool     `json:"disableRenewal,omitempty"`
+	MinTLSDur     *Duration `json:"minTLSCertDuration,omitempty"`
+	MaxTLSDur     *Duration `json:"maxTLSCertDuration,omitempty"`
+	DefaultTLSDur *Duration `json:"defaultTLSCertDuration,omitempty"`
+
 	// SSH CA properties
 	MinUserSSHDur     *Duration `json:"minUserSSHCertDuration,omitempty"`
 	MaxUserSSHDur     *Duration `json:"maxUserSSHCertDuration,omitempty"`
@@ -22,6 +22,13 @@ type Claims struct {
 	MaxHostSSHDur     *Duration `json:"maxHostSSHCertDuration,omitempty"`
 	DefaultHostSSHDur *Duration `json:"defaultHostSSHCertDuration,omitempty"`
 	EnableSSHCA       *bool     `json:"enableSSHCA,omitempty"`
+
+	// Renewal properties
+	DisableRenewal          *bool `json:"disableRenewal,omitempty"`
+	AllowRenewalAfterExpiry *bool `json:"allowRenewalAfterExpiry,omitempty"`
+
+	// Other properties
+	DisableSmallstepExtensions *bool `json:"disableSmallstepExtensions,omitempty"`
 }
 
 // Claimer is the type that controls claims. It provides an interface around the
@@ -34,25 +41,31 @@ type Claimer struct {
 // NewClaimer initializes a new claimer with the given claims.
 func NewClaimer(claims *Claims, global Claims) (*Claimer, error) {
 	c := &Claimer{global: global, claims: claims}
-	return c, c.Validate()
+	err := c.Validate()
+	return c, err
 }
 
 // Claims returns the merge of the inner and global claims.
 func (c *Claimer) Claims() Claims {
 	disableRenewal := c.IsDisableRenewal()
+	allowRenewalAfterExpiry := c.AllowRenewalAfterExpiry()
 	enableSSHCA := c.IsSSHCAEnabled()
+	disableSmallstepExtensions := c.IsDisableSmallstepExtensions()
+
 	return Claims{
-		MinTLSDur:         &Duration{c.MinTLSCertDuration()},
-		MaxTLSDur:         &Duration{c.MaxTLSCertDuration()},
-		DefaultTLSDur:     &Duration{c.DefaultTLSCertDuration()},
-		DisableRenewal:    &disableRenewal,
-		MinUserSSHDur:     &Duration{c.MinUserSSHCertDuration()},
-		MaxUserSSHDur:     &Duration{c.MaxUserSSHCertDuration()},
-		DefaultUserSSHDur: &Duration{c.DefaultUserSSHCertDuration()},
-		MinHostSSHDur:     &Duration{c.MinHostSSHCertDuration()},
-		MaxHostSSHDur:     &Duration{c.MaxHostSSHCertDuration()},
-		DefaultHostSSHDur: &Duration{c.DefaultHostSSHCertDuration()},
-		EnableSSHCA:       &enableSSHCA,
+		MinTLSDur:                  &Duration{c.MinTLSCertDuration()},
+		MaxTLSDur:                  &Duration{c.MaxTLSCertDuration()},
+		DefaultTLSDur:              &Duration{c.DefaultTLSCertDuration()},
+		MinUserSSHDur:              &Duration{c.MinUserSSHCertDuration()},
+		MaxUserSSHDur:              &Duration{c.MaxUserSSHCertDuration()},
+		DefaultUserSSHDur:          &Duration{c.DefaultUserSSHCertDuration()},
+		MinHostSSHDur:              &Duration{c.MinHostSSHCertDuration()},
+		MaxHostSSHDur:              &Duration{c.MaxHostSSHCertDuration()},
+		DefaultHostSSHDur:          &Duration{c.DefaultHostSSHCertDuration()},
+		EnableSSHCA:                &enableSSHCA,
+		DisableRenewal:             &disableRenewal,
+		AllowRenewalAfterExpiry:    &allowRenewalAfterExpiry,
+		DisableSmallstepExtensions: &disableSmallstepExtensions,
 	}
 }
 
@@ -71,6 +84,9 @@ func (c *Claimer) DefaultTLSCertDuration() time.Duration {
 // minimum from the authority configuration will be used.
 func (c *Claimer) MinTLSCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MinTLSDur == nil {
+		if c.claims != nil && c.claims.DefaultTLSDur != nil && c.claims.DefaultTLSDur.Duration < c.global.MinTLSDur.Duration {
+			return c.claims.DefaultTLSDur.Duration
+		}
 		return c.global.MinTLSDur.Duration
 	}
 	return c.claims.MinTLSDur.Duration
@@ -81,6 +97,9 @@ func (c *Claimer) MinTLSCertDuration() time.Duration {
 // maximum from the authority configuration will be used.
 func (c *Claimer) MaxTLSCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MaxTLSDur == nil {
+		if c.claims != nil && c.claims.DefaultTLSDur != nil && c.claims.DefaultTLSDur.Duration > c.global.MaxTLSDur.Duration {
+			return c.claims.DefaultTLSDur.Duration
+		}
 		return c.global.MaxTLSDur.Duration
 	}
 	return c.claims.MaxTLSDur.Duration
@@ -94,6 +113,25 @@ func (c *Claimer) IsDisableRenewal() bool {
 		return *c.global.DisableRenewal
 	}
 	return *c.claims.DisableRenewal
+}
+
+// IsDisableSmallstepExtensions returns whether Smallstep extensions, such as
+// the provisioner extension, should be excluded from the certificate.
+func (c *Claimer) IsDisableSmallstepExtensions() bool {
+	if c.claims == nil || c.claims.DisableSmallstepExtensions == nil {
+		return *c.global.DisableSmallstepExtensions
+	}
+	return *c.claims.DisableSmallstepExtensions
+}
+
+// AllowRenewalAfterExpiry returns if the renewal flow is authorized if the
+// certificate is expired. If the property is not set within the provisioner
+// then the global value from the authority configuration will be used.
+func (c *Claimer) AllowRenewalAfterExpiry() bool {
+	if c.claims == nil || c.claims.AllowRenewalAfterExpiry == nil {
+		return *c.global.AllowRenewalAfterExpiry
+	}
+	return *c.claims.AllowRenewalAfterExpiry
 }
 
 // DefaultSSHCertDuration returns the default SSH certificate duration for the
@@ -126,6 +164,9 @@ func (c *Claimer) DefaultUserSSHCertDuration() time.Duration {
 // global minimum from the authority configuration will be used.
 func (c *Claimer) MinUserSSHCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MinUserSSHDur == nil {
+		if c.claims != nil && c.claims.DefaultUserSSHDur != nil && c.claims.DefaultUserSSHDur.Duration < c.global.MinUserSSHDur.Duration {
+			return c.claims.DefaultUserSSHDur.Duration
+		}
 		return c.global.MinUserSSHDur.Duration
 	}
 	return c.claims.MinUserSSHDur.Duration
@@ -136,6 +177,9 @@ func (c *Claimer) MinUserSSHCertDuration() time.Duration {
 // global maximum from the authority configuration will be used.
 func (c *Claimer) MaxUserSSHCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MaxUserSSHDur == nil {
+		if c.claims != nil && c.claims.DefaultUserSSHDur != nil && c.claims.DefaultUserSSHDur.Duration > c.global.MaxUserSSHDur.Duration {
+			return c.claims.DefaultUserSSHDur.Duration
+		}
 		return c.global.MaxUserSSHDur.Duration
 	}
 	return c.claims.MaxUserSSHDur.Duration
@@ -156,6 +200,9 @@ func (c *Claimer) DefaultHostSSHCertDuration() time.Duration {
 // global minimum from the authority configuration will be used.
 func (c *Claimer) MinHostSSHCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MinHostSSHDur == nil {
+		if c.claims != nil && c.claims.DefaultHostSSHDur != nil && c.claims.DefaultHostSSHDur.Duration < c.global.MinHostSSHDur.Duration {
+			return c.claims.DefaultHostSSHDur.Duration
+		}
 		return c.global.MinHostSSHDur.Duration
 	}
 	return c.claims.MinHostSSHDur.Duration
@@ -166,6 +213,9 @@ func (c *Claimer) MinHostSSHCertDuration() time.Duration {
 // global maximum from the authority configuration will be used.
 func (c *Claimer) MaxHostSSHCertDuration() time.Duration {
 	if c.claims == nil || c.claims.MaxHostSSHDur == nil {
+		if c.claims != nil && c.claims.DefaultHostSSHDur != nil && c.claims.DefaultHostSSHDur.Duration > c.global.MaxHostSSHDur.Duration {
+			return c.claims.DefaultHostSSHDur.Duration
+		}
 		return c.global.MaxHostSSHDur.Duration
 	}
 	return c.claims.MaxHostSSHDur.Duration
@@ -184,24 +234,24 @@ func (c *Claimer) IsSSHCAEnabled() bool {
 // Validate validates and modifies the Claims with default values.
 func (c *Claimer) Validate() error {
 	var (
-		min = c.MinTLSCertDuration()
-		max = c.MaxTLSCertDuration()
-		def = c.DefaultTLSCertDuration()
+		minDur = c.MinTLSCertDuration()
+		maxDur = c.MaxTLSCertDuration()
+		defDur = c.DefaultTLSCertDuration()
 	)
 	switch {
-	case min <= 0:
+	case minDur <= 0:
 		return errors.Errorf("claims: MinTLSCertDuration must be greater than 0")
-	case max <= 0:
+	case maxDur <= 0:
 		return errors.Errorf("claims: MaxTLSCertDuration must be greater than 0")
-	case def <= 0:
+	case defDur <= 0:
 		return errors.Errorf("claims: DefaultTLSCertDuration must be greater than 0")
-	case max < min:
+	case maxDur < minDur:
 		return errors.Errorf("claims: MaxCertDuration cannot be less "+
-			"than MinCertDuration: MaxCertDuration - %v, MinCertDuration - %v", max, min)
-	case def < min:
-		return errors.Errorf("claims: DefaultCertDuration cannot be less than MinCertDuration: DefaultCertDuration - %v, MinCertDuration - %v", def, min)
-	case max < def:
-		return errors.Errorf("claims: MaxCertDuration cannot be less than DefaultCertDuration: MaxCertDuration - %v, DefaultCertDuration - %v", max, def)
+			"than MinCertDuration: MaxCertDuration - %v, MinCertDuration - %v", maxDur, minDur)
+	case defDur < minDur:
+		return errors.Errorf("claims: DefaultCertDuration cannot be less than MinCertDuration: DefaultCertDuration - %v, MinCertDuration - %v", defDur, minDur)
+	case maxDur < defDur:
+		return errors.Errorf("claims: MaxCertDuration cannot be less than DefaultCertDuration: MaxCertDuration - %v, DefaultCertDuration - %v", maxDur, defDur)
 	default:
 		return nil
 	}

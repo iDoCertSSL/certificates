@@ -1,9 +1,12 @@
 package errs
 
 import (
+	"errors"
 	"fmt"
-	"reflect"
+	"net/http"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestError_MarshalJSON(t *testing.T) {
@@ -27,13 +30,14 @@ func TestError_MarshalJSON(t *testing.T) {
 				Err:    tt.fields.Err,
 			}
 			got, err := e.MarshalJSON()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Error.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Empty(t, got)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Error.MarshalJSON() = %s, want %s", got, tt.want)
-			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -54,12 +58,72 @@ func TestError_UnmarshalJSON(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := new(Error)
-			if err := e.UnmarshalJSON(tt.args.data); (err != nil) != tt.wantErr {
-				t.Errorf("Error.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+			err := e.UnmarshalJSON(tt.args.data)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
 			}
-			if !reflect.DeepEqual(tt.expected, e) {
-				t.Errorf("Error.UnmarshalJSON() wants = %v, got %v", tt.expected, e)
-			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, e)
+		})
+	}
+}
+
+func TestError_Unwrap(t *testing.T) {
+	err := errors.New("wrapped error")
+	tests := []struct {
+		name  string
+		error error
+		want  string
+	}{
+		{"ok New", New(http.StatusBadRequest, "some error"), "some error"},
+		{"ok New v-wrap", New(http.StatusBadRequest, "some error: %v", err), "some error: wrapped error"},
+		{"ok NewError", NewError(http.StatusBadRequest, err, "some error"), "some error: wrapped error"},
+		{"ok NewErr", NewErr(http.StatusBadRequest, err), "wrapped error"},
+		{"ok NewErr wit message", NewErr(http.StatusBadRequest, err, WithMessage("some message")), "wrapped error"},
+		{"ok Errorf", Errorf(http.StatusBadRequest, "some error: %w", err), "some error: wrapped error"},
+		{"ok Errorf v-wrap", Errorf(http.StatusBadRequest, "some error: %v", err), "some error: wrapped error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := errors.Unwrap(tt.error)
+			assert.EqualError(t, got, tt.want)
+		})
+	}
+}
+
+type customError struct {
+	Message string
+}
+
+func (e *customError) Error() string {
+	return e.Message
+}
+
+func TestError_Unwrap_As(t *testing.T) {
+	err := &customError{Message: "wrapped error"}
+
+	tests := []struct {
+		name    string
+		error   error
+		want    bool
+		wantErr *customError
+	}{
+		{"ok NewError", NewError(http.StatusBadRequest, err, "some error"), true, err},
+		{"ok NewErr", NewErr(http.StatusBadRequest, err), true, err},
+		{"ok NewErr wit message", NewErr(http.StatusBadRequest, err, WithMessage("some message")), true, err},
+		{"ok Errorf", Errorf(http.StatusBadRequest, "some error: %w", err), true, err},
+		{"fail New", New(http.StatusBadRequest, "some error"), false, nil},
+		{"fail New v-wrap", New(http.StatusBadRequest, "some error: %v", err), false, nil},
+		{"fail Errorf", Errorf(http.StatusBadRequest, "some error"), false, nil},
+		{"fail Errorf v-wrap", Errorf(http.StatusBadRequest, "some error: %v", err), false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cerr *customError
+			assert.Equal(t, tt.want, errors.As(tt.error, &cerr))
+			assert.Equal(t, tt.wantErr, cerr)
 		})
 	}
 }

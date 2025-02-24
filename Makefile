@@ -1,26 +1,28 @@
 PKG?=github.com/smallstep/certificates/cmd/step-ca
 BINNAME?=step-ca
-CLOUDKMS_BINNAME?=step-cloudkms-init
-CLOUDKMS_PKG?=github.com/smallstep/certificates/cmd/step-cloudkms-init
 
 # Set V to 1 for verbose output from the Makefile
 Q=$(if $V,,@)
 PREFIX?=
 SRC=$(shell find . -type f -name '*.go' -not -path "./vendor/*")
 GOOS_OVERRIDE ?=
-OUTPUT_ROOT=output/
 
-all: build test lint
+all: lint test build
 
-.PHONY: all
+ci: testcgo build
+
+.PHONY: all ci
 
 #########################################
 # Bootstrapping
 #########################################
 
 bootstra%:
-	# Using a released version of golangci-lint to take into account custom replacements in their go.mod
-	$Q curl -sSfL https://raw.githubusercontent.com/smallstep/cli/master/make/golangci-install.sh | sh -s -- -b $(shell go env GOPATH)/bin v1.19.1
+	$Q curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin latest
+	$Q go install golang.org/x/vuln/cmd/govulncheck@latest
+	$Q go install gotest.tools/gotestsum@latest
+	$Q go install github.com/goreleaser/goreleaser@latest
+	$Q go install github.com/sigstore/cosign/v2/cmd/cosign@latest
 
 .PHONY: bootstra%
 
@@ -28,23 +30,29 @@ bootstra%:
 # Determine the type of `push` and `version`
 #################################################
 
-# Version flags to embed in the binaries
+# GITHUB Actions
+ifdef GITHUB_REF
+VERSION ?= $(shell echo $(GITHUB_REF) | sed 's/^refs\/tags\///')
+NOT_RC  := $(shell echo $(VERSION) | grep -v -e -rc)
+	ifeq ($(NOT_RC),)
+PUSHTYPE := release-candidate
+	else
+PUSHTYPE := release
+	endif
+else
 VERSION ?= $(shell [ -d .git ] && git describe --tags --always --dirty="-dev")
 # If we are not in an active git dir then try reading the version from .VERSION.
 # .VERSION contains a slug populated by `git archive`.
 VERSION := $(or $(VERSION),$(shell ./.version.sh .VERSION))
-VERSION := $(shell echo $(VERSION) | sed 's/^v//')
-NOT_RC  := $(shell echo $(VERSION) | grep -v -e -rc)
+PUSHTYPE := branch
+endif
 
-# If TRAVIS_TAG is set then we know this ref has been tagged.
-ifdef TRAVIS_TAG
-	ifeq ($(NOT_RC),)
-		PUSHTYPE=release-candidate
-	else
-		PUSHTYPE=release
-	endif
-else
-	PUSHTYPE=master
+VERSION := $(shell echo $(VERSION) | sed 's/^v//')
+
+ifdef V
+$(info    GITHUB_REF is $(GITHUB_REF))
+$(info    VERSION is $(VERSION))
+$(info    PUSHTYPE is $(PUSHTYPE))
 endif
 
 #########################################
@@ -53,28 +61,36 @@ endif
 
 DATE    := $(shell date -u '+%Y-%m-%d %H:%M UTC')
 LDFLAGS := -ldflags='-w -X "main.Version=$(VERSION)" -X "main.BuildTime=$(DATE)"'
-GOFLAGS := CGO_ENABLED=0
+
+# Always explicitly enable or disable cgo,
+# so that go doesn't silently fall back on
+# non-cgo when gcc is not found.
+ifeq (,$(findstring CGO_ENABLED,$(GO_ENVS)))
+	ifneq ($(origin GOFLAGS),undefined)
+		# This section is for backward compatibility with 
+		# 
+		# $ make build GOFLAGS=""
+		#
+		# which is how we recommended building step-ca with cgo support
+		# until June 2023.
+		GO_ENVS := $(GO_ENVS) CGO_ENABLED=1
+	else
+		GO_ENVS := $(GO_ENVS) CGO_ENABLED=0
+	endif
+endif
 
 download:
 	$Q go mod download
 
-build: $(PREFIX)bin/$(BINNAME) $(PREFIX)bin/$(CLOUDKMS_BINNAME)
+build: $(PREFIX)bin/$(BINNAME)
 	@echo "Build Complete!"
 
 $(PREFIX)bin/$(BINNAME): download $(call rwildcard,*.go)
 	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(BINNAME) $(LDFLAGS) $(PKG)
-
-$(PREFIX)bin/$(CLOUDKMS_BINNAME): download $(call rwildcard,*.go)
-	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(LDFLAGS) $(CLOUDKMS_PKG)
+	$Q $(GOOS_OVERRIDE) GOFLAGS="$(GOFLAGS)" $(GO_ENVS) go build -v -o $(PREFIX)bin/$(BINNAME) $(LDFLAGS) $(PKG)
 
 # Target to force a build of step-ca without running tests
-simple:
-	$Q mkdir -p $(PREFIX)bin
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(BINNAME) $(LDFLAGS) $(PKG)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(LDFLAGS) $(CLOUDKMS_PKG)
-	@echo "Build Complete!"
+simple: build
 
 .PHONY: download build simple
 
@@ -90,15 +106,26 @@ generate:
 #########################################
 # Test
 #########################################
-test:
-	$Q $(GOFLAGS) go test -short -coverprofile=coverage.out ./...
+test: testdefault testtpmsimulator combinecoverage
 
-.PHONY: test
+testdefault:
+	$Q $(GO_ENVS) gotestsum -- -coverprofile=defaultcoverage.out -short -covermode=atomic ./...
+
+testtpmsimulator:
+	$Q CGO_ENABLED=1 gotestsum -- -coverprofile=tpmsimulatorcoverage.out -short -covermode=atomic -tags tpmsimulator ./acme 
+
+testcgo:
+	$Q gotestsum -- -coverprofile=coverage.out -short -covermode=atomic ./...
+
+combinecoverage:
+	cat defaultcoverage.out tpmsimulatorcoverage.out > coverage.out
+
+.PHONY: test testdefault testtpmsimulator testcgo combinecoverage
 
 integrate: integration
 
 integration: bin/$(BINNAME)
-	$Q $(GOFLAGS) go test -tags=integration ./integration/...
+	$Q $(GO_ENVS) gotestsum -- -tags=integration ./integration/...
 
 .PHONY: integrate integration
 
@@ -107,26 +134,26 @@ integration: bin/$(BINNAME)
 #########################################
 
 fmt:
-	$Q gofmt -l -w $(SRC)
+	$Q goimports -l -w $(SRC)
 
+lint: SHELL:=/bin/bash
 lint:
-	$Q LOG_LEVEL=error golangci-lint run
+	$Q LOG_LEVEL=error golangci-lint run --config <(curl -s https://raw.githubusercontent.com/smallstep/workflows/master/.golangci.yml) --timeout=30m
+	$Q govulncheck ./...
 
-.PHONY: lint fmt
+.PHONY: fmt lint
 
 #########################################
 # Install
 #########################################
 
-INSTALL_PREFIX?=/usr/
+INSTALL_PREFIX?=/usr/local/
 
-install: $(PREFIX)bin/$(BINNAME) $(PREFIX)bin/$(CLOUDKMS_BINNAME)
+install: $(PREFIX)bin/$(BINNAME)
 	$Q install -D $(PREFIX)bin/$(BINNAME) $(DESTDIR)$(INSTALL_PREFIX)bin/$(BINNAME)
-	$Q install -D $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(DESTDIR)$(INSTALL_PREFIX)bin/$(CLOUDKMS_BINNAME)
 
 uninstall:
 	$Q rm -f $(DESTDIR)$(INSTALL_PREFIX)/bin/$(BINNAME)
-	$Q rm -f $(DESTDIR)$(INSTALL_PREFIX)/bin/$(CLOUDKMS_BINNAME)
 
 .PHONY: install uninstall
 
@@ -138,171 +165,15 @@ clean:
 ifneq ($(BINNAME),"")
 	$Q rm -f bin/$(BINNAME)
 endif
-ifneq ($(CLOUDKMS_BINNAME),"")
-	$Q rm -f bin/$(CLOUDKMS_BINNAME)
-endif
 
 .PHONY: clean
 
 #########################################
-# Building Docker Image
-#
-# Builds a dockerfile for step by building a linux version of the step-cli and
-# then copying the specific binary when building the container.
-#
-# This ensures the container is as small as possible without having to deal
-# with getting access to private repositories inside the container during build
-# time.
+# Dev
 #########################################
 
-# XXX We put the output for the build in 'output' so we don't mess with how we
-# do rule overriding from the base Makefile (if you name it 'build' it messes up
-# the wildcarding).
-DOCKER_OUTPUT=$(OUTPUT_ROOT)docker/
+run:
+	$Q go run cmd/step-ca/main.go $(shell step path)/config/ca.json
 
-DOCKER_MAKE=V=$V GOOS_OVERRIDE='GOOS=linux GOARCH=amd64' PREFIX=$(1) make $(1)bin/$(2)
-DOCKER_BUILD=$Q docker build -t smallstep/$(1):latest -f docker/$(2) --build-arg BINPATH=$(DOCKER_OUTPUT)bin/$(1) .
+.PHONY: run
 
-docker: docker-make docker/Dockerfile.step-ca
-	$(call DOCKER_BUILD,step-ca,Dockerfile.step-ca)
-
-docker-make:
-	mkdir -p $(DOCKER_OUTPUT)
-	$(call DOCKER_MAKE,$(DOCKER_OUTPUT),step-ca)
-
-.PHONY: docker docker-make
-
-#################################################
-# Releasing Docker Images
-#
-# Using the docker build infrastructure, this section is responsible for
-# logging into docker hub and pushing the built docker containers up with the
-# appropriate tags.
-#################################################
-
-DOCKER_TAG=docker tag smallstep/$(1):latest smallstep/$(1):$(2)
-DOCKER_PUSH=docker push smallstep/$(1):$(2)
-
-docker-tag:
-	$(call DOCKER_TAG,step-ca,$(VERSION))
-
-docker-push-tag: docker-tag
-	$(call DOCKER_PUSH,step-ca,$(VERSION))
-
-docker-push-tag-latest:
-	$(call DOCKER_PUSH,step-ca,latest)
-
-# Rely on DOCKER_USERNAME and DOCKER_PASSWORD being set inside the CI or
-# equivalent environment
-docker-login:
-	$Q docker login -u="$(DOCKER_USERNAME)" -p="$(DOCKER_PASSWORD)"
-
-.PHONY: docker-login docker-tag docker-push-tag docker-push-tag-latest
-
-#################################################
-# Targets for pushing the docker images
-#################################################
-
-# For all builds we build the docker container
-docker-master: docker
-
-# For all builds with a release candidate tag
-docker-release-candidate: docker-master docker-login docker-push-tag
-
-# For all builds with a release tag
-docker-release: docker-release-candidate docker-push-tag-latest
-
-.PHONY: docker-master docker-release-candidate docker-release
-
-#########################################
-# Debian
-#########################################
-
-changelog:
-	$Q echo "step-certificates ($(VERSION)) unstable; urgency=medium" > debian/changelog
-	$Q echo >> debian/changelog
-	$Q echo "  * See https://github.com/smallstep/certificates/releases" >> debian/changelog
-	$Q echo >> debian/changelog
-	$Q echo " -- Smallstep Labs, Inc. <techadmin@smallstep.com>  $(shell date -uR)" >> debian/changelog
-
-debian: changelog
-	$Q mkdir -p $(RELEASE); \
-	OUTPUT=../step-certificates_*.deb; \
-	rm $$OUTPUT; \
-	dpkg-buildpackage -b -rfakeroot -us -uc && cp $$OUTPUT $(RELEASE)/
-
-distclean: clean
-
-.PHONY: changelog debian distclean
-
-#################################################
-# Build statically compiled step binary for various operating systems
-#################################################
-
-BINARY_OUTPUT=$(OUTPUT_ROOT)binary/
-BUNDLE_MAKE=v=$v GOOS_OVERRIDE='GOOS=$(1) GOARCH=$(2)' PREFIX=$(3) make $(3)bin/$(BINNAME) $(3)bin/$(CLOUDKMS_BINNAME)
-RELEASE=./.travis-releases
-
-binary-linux:
-	$(call BUNDLE_MAKE,linux,amd64,$(BINARY_OUTPUT)linux/)
-
-binary-darwin:
-	$(call BUNDLE_MAKE,darwin,amd64,$(BINARY_OUTPUT)darwin/)
-
-define BUNDLE
-	$(q)BUNDLE_DIR=$(BINARY_OUTPUT)$(1)/bundle; \
-	stepName=step-certificates_$(2); \
- 	mkdir -p $$BUNDLE_DIR $(RELEASE); \
-	TMP=$$(mktemp -d $$BUNDLE_DIR/tmp.XXXX); \
-	trap "rm -rf $$TMP" EXIT INT QUIT TERM; \
-	newdir=$$TMP/$$stepName; \
-	mkdir -p $$newdir/bin; \
-	cp $(BINARY_OUTPUT)$(1)/bin/$(BINNAME) $$newdir/bin/; \
-	cp $(BINARY_OUTPUT)$(1)/bin/$(CLOUDKMS_BINNAME) $$newdir/bin/; \
-	cp README.md $$newdir/; \
-	NEW_BUNDLE=$(RELEASE)/step-certificates_$(2)_$(1)_$(3).tar.gz; \
-	rm -f $$NEW_BUNDLE; \
-    tar -zcvf $$NEW_BUNDLE -C $$TMP $$stepName;
-endef
-
-bundle-linux: binary-linux
-	$(call BUNDLE,linux,$(VERSION),amd64)
-
-bundle-darwin: binary-darwin
-	$(call BUNDLE,darwin,$(VERSION),amd64)
-
-.PHONY: binary-linux binary-darwin bundle-linux bundle-darwin
-
-#################################################
-# Targets for creating OS specific artifacts and archives
-#################################################
-
-artifacts-linux-tag: bundle-linux debian
-
-artifacts-darwin-tag: bundle-darwin
-
-artifacts-archive-tag:
-	$Q mkdir -p $(RELEASE)
-	$Q git archive v$(VERSION) | gzip > $(RELEASE)/step-certificates_$(VERSION).tar.gz
-
-artifacts-tag: artifacts-linux-tag artifacts-darwin-tag artifacts-archive-tag
-
-.PHONY: artifacts-linux-tag artifacts-darwin-tag artifacts-archive-tag artifacts-tag
-
-#################################################
-# Targets for creating step artifacts
-#################################################
-
-# For all builds that are not tagged
-artifacts-master:
-
-# For all builds with a release-candidate (-rc) tag
-artifacts-release-candidate: artifacts-tag
-
-# For all builds with a release tag
-artifacts-release: artifacts-tag
-
-# This command is called by travis directly *after* a successful build
-artifacts: artifacts-$(PUSHTYPE) docker-$(PUSHTYPE)
-
-.PHONY: artifacts-master artifacts-release-candidate artifacts-release artifacts

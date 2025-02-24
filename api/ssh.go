@@ -6,29 +6,36 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/smallstep/certificates/api/read"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/sshutil"
+	"github.com/smallstep/certificates/internal/cast"
 	"github.com/smallstep/certificates/templates"
-	"golang.org/x/crypto/ssh"
 )
 
 // SSHAuthority is the interface implemented by a SSH CA authority.
 type SSHAuthority interface {
-	SignSSH(key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
-	RenewSSH(cert *ssh.Certificate) (*ssh.Certificate, error)
-	RekeySSH(cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
-	SignSSHAddUser(key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
-	GetSSHRoots() (*authority.SSHKeys, error)
-	GetSSHFederation() (*authority.SSHKeys, error)
-	GetSSHConfig(typ string, data map[string]string) ([]templates.Output, error)
+	SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	RenewSSH(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error)
+	RekeySSH(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	SignSSHAddUser(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
+	GetSSHRoots(ctx context.Context) (*config.SSHKeys, error)
+	GetSSHFederation(ctx context.Context) (*config.SSHKeys, error)
+	GetSSHConfig(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error)
 	CheckSSHHost(ctx context.Context, principal string, token string) (bool, error)
-	GetSSHHosts(cert *x509.Certificate) ([]sshutil.Host, error)
-	GetSSHBastion(user string, hostname string) (*authority.Bastion, error)
+	GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]config.Host, error)
+	GetSSHBastion(ctx context.Context, user string, hostname string) (*config.Bastion, error)
 }
 
 // SSHSignRequest is the request body of an SSH certificate request.
@@ -36,28 +43,29 @@ type SSHSignRequest struct {
 	PublicKey        []byte             `json:"publicKey"` // base64 encoded
 	OTT              string             `json:"ott"`
 	CertType         string             `json:"certType,omitempty"`
+	KeyID            string             `json:"keyID,omitempty"`
 	Principals       []string           `json:"principals,omitempty"`
 	ValidAfter       TimeDuration       `json:"validAfter,omitempty"`
 	ValidBefore      TimeDuration       `json:"validBefore,omitempty"`
 	AddUserPublicKey []byte             `json:"addUserPublicKey,omitempty"`
-	KeyID            string             `json:"keyID"`
 	IdentityCSR      CertificateRequest `json:"identityCSR,omitempty"`
+	TemplateData     json.RawMessage    `json:"templateData,omitempty"`
 }
 
 // Validate validates the SSHSignRequest.
 func (s *SSHSignRequest) Validate() error {
 	switch {
 	case s.CertType != "" && s.CertType != provisioner.SSHUserCert && s.CertType != provisioner.SSHHostCert:
-		return errors.Errorf("unknown certType %s", s.CertType)
+		return errs.BadRequest("invalid certType '%s'", s.CertType)
 	case len(s.PublicKey) == 0:
-		return errors.New("missing or empty publicKey")
-	case len(s.OTT) == 0:
-		return errors.New("missing or empty ott")
+		return errs.BadRequest("missing or empty publicKey")
+	case s.OTT == "":
+		return errs.BadRequest("missing or empty ott")
 	default:
 		// Validate identity signature if provided
 		if s.IdentityCSR.CertificateRequest != nil {
 			if err := s.IdentityCSR.CertificateRequest.CheckSignature(); err != nil {
-				return errors.Wrap(err, "invalid identityCSR")
+				return errs.BadRequestErr(err, "invalid identityCSR")
 			}
 		}
 		return nil
@@ -86,7 +94,7 @@ type SSHCertificate struct {
 // SSHGetHostsResponse is the response object that returns the list of valid
 // hosts for SSH.
 type SSHGetHostsResponse struct {
-	Hosts []sshutil.Host `json:"hosts"`
+	Hosts []config.Host `json:"hosts"`
 }
 
 // MarshalJSON implements the json.Marshaler interface. Returns a quoted,
@@ -184,7 +192,7 @@ func (r *SSHConfigRequest) Validate() error {
 	case provisioner.SSHUserCert, provisioner.SSHHostCert:
 		return nil
 	default:
-		return errors.Errorf("unsupported type %s", r.Type)
+		return errs.BadRequest("invalid type '%s'", r.Type)
 	}
 }
 
@@ -207,9 +215,9 @@ type SSHCheckPrincipalRequest struct {
 func (r *SSHCheckPrincipalRequest) Validate() error {
 	switch {
 	case r.Type != provisioner.SSHHostCert:
-		return errors.Errorf("unsupported type %s", r.Type)
+		return errs.BadRequest("unsupported type '%s'", r.Type)
 	case r.Principal == "":
-		return errors.New("missing or empty principal")
+		return errs.BadRequest("missing or empty principal")
 	default:
 		return nil
 	}
@@ -231,7 +239,7 @@ type SSHBastionRequest struct {
 // Validate checks the values of the SSHBastionRequest.
 func (r *SSHBastionRequest) Validate() error {
 	if r.Hostname == "" {
-		return errors.New("missing or empty hostname")
+		return errs.BadRequest("missing or empty hostname")
 	}
 	return nil
 }
@@ -239,29 +247,29 @@ func (r *SSHBastionRequest) Validate() error {
 // SSHBastionResponse is the response body used to return the bastion for a
 // given host.
 type SSHBastionResponse struct {
-	Hostname string             `json:"hostname"`
-	Bastion  *authority.Bastion `json:"bastion,omitempty"`
+	Hostname string          `json:"hostname"`
+	Bastion  *config.Bastion `json:"bastion,omitempty"`
 }
 
 // SSHSign is an HTTP handler that reads an SignSSHRequest with a one-time-token
 // (ott) from the body and creates a new SSH certificate with the information in
 // the request.
-func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
+func SSHSign(w http.ResponseWriter, r *http.Request) {
 	var body SSHSignRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, r, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 
 	logOtt(w, body.OTT)
 	if err := body.Validate(); err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, r, err)
 		return
 	}
 
 	publicKey, err := ssh.ParsePublicKey(body.PublicKey)
 	if err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error parsing publicKey"))
+		render.Error(w, r, errs.BadRequestErr(err, "error parsing publicKey"))
 		return
 	}
 
@@ -269,37 +277,42 @@ func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
 	if body.AddUserPublicKey != nil {
 		addUserPublicKey, err = ssh.ParsePublicKey(body.AddUserPublicKey)
 		if err != nil {
-			WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error parsing addUserPublicKey"))
+			render.Error(w, r, errs.BadRequestErr(err, "error parsing addUserPublicKey"))
 			return
 		}
 	}
 
-	opts := provisioner.SSHOptions{
-		CertType:    body.CertType,
-		KeyID:       body.KeyID,
-		Principals:  body.Principals,
-		ValidBefore: body.ValidBefore,
-		ValidAfter:  body.ValidAfter,
+	opts := provisioner.SignSSHOptions{
+		CertType:     body.CertType,
+		KeyID:        body.KeyID,
+		Principals:   body.Principals,
+		ValidBefore:  body.ValidBefore,
+		ValidAfter:   body.ValidAfter,
+		TemplateData: body.TemplateData,
 	}
 
-	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SSHSignMethod)
-	signOpts, err := h.Authority.Authorize(ctx, body.OTT)
+	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHSignMethod)
+	ctx = provisioner.NewContextWithToken(ctx, body.OTT)
+	ctx = provisioner.NewContextWithCertType(ctx, opts.CertType)
+
+	a := mustAuthority(ctx)
+	signOpts, err := a.Authorize(ctx, body.OTT)
 	if err != nil {
-		WriteError(w, errs.UnauthorizedErr(err))
+		render.Error(w, r, errs.UnauthorizedErr(err))
 		return
 	}
 
-	cert, err := h.Authority.SignSSH(publicKey, opts, signOpts...)
+	cert, err := a.SignSSH(ctx, publicKey, opts, signOpts...)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		render.Error(w, r, errs.ForbiddenErr(err, "error signing ssh certificate"))
 		return
 	}
 
 	var addUserCertificate *SSHCertificate
-	if addUserPublicKey != nil && cert.CertType == ssh.UserCert && len(cert.ValidPrincipals) == 1 {
-		addUserCert, err := h.Authority.SignSSHAddUser(addUserPublicKey, cert)
+	if addUserPublicKey != nil && authority.IsValidForAddUser(cert) == nil {
+		addUserCert, err := a.SignSSHAddUser(ctx, addUserPublicKey, cert)
 		if err != nil {
-			WriteError(w, errs.ForbiddenErr(err))
+			render.Error(w, r, errs.ForbiddenErr(err, "error signing ssh certificate"))
 			return
 		}
 		addUserCertificate = &SSHCertificate{addUserCert}
@@ -308,30 +321,31 @@ func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
 	// Sign identity certificate if available.
 	var identityCertificate []Certificate
 	if cr := body.IdentityCSR.CertificateRequest; cr != nil {
-		var opts provisioner.Options
-		// Use same duration as ssh certificate for user certificates
-		if cert.CertType == ssh.UserCert {
-			opts = provisioner.Options{
-				NotBefore: provisioner.NewTimeDuration(time.Unix(int64(cert.ValidAfter), 0)),
-				NotAfter:  provisioner.NewTimeDuration(time.Unix(int64(cert.ValidBefore), 0)),
-			}
-		}
-		ctx := authority.NewContextWithSkipTokenReuse(context.Background())
-		ctx = provisioner.NewContextWithMethod(ctx, provisioner.SignMethod)
-		signOpts, err := h.Authority.Authorize(ctx, body.OTT)
+		ctx := authority.NewContextWithSkipTokenReuse(r.Context())
+		ctx = provisioner.NewContextWithMethod(ctx, provisioner.SignIdentityMethod)
+		signOpts, err := a.Authorize(ctx, body.OTT)
 		if err != nil {
-			WriteError(w, errs.UnauthorizedErr(err))
+			render.Error(w, r, errs.UnauthorizedErr(err))
 			return
 		}
-		certChain, err := h.Authority.Sign(cr, opts, signOpts...)
+
+		// Enforce the same duration as ssh certificate.
+		signOpts = append(signOpts, &identityModifier{
+			Identity:  getIdentityURI(cr),
+			NotBefore: time.Unix(cast.Int64(cert.ValidAfter), 0),
+			NotAfter:  time.Unix(cast.Int64(cert.ValidBefore), 0),
+		})
+
+		certChain, err := a.SignWithContext(ctx, cr, provisioner.SignOptions{}, signOpts...)
 		if err != nil {
-			WriteError(w, errs.ForbiddenErr(err))
+			render.Error(w, r, errs.ForbiddenErr(err, "error signing identity certificate"))
 			return
 		}
 		identityCertificate = certChainToPEM(certChain)
 	}
 
-	JSONStatus(w, &SSHSignResponse{
+	LogSSHCertificate(w, cert)
+	render.JSONStatus(w, r, &SSHSignResponse{
 		Certificate:         SSHCertificate{cert},
 		AddUserCertificate:  addUserCertificate,
 		IdentityCertificate: identityCertificate,
@@ -340,15 +354,16 @@ func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
 
 // SSHRoots is an HTTP handler that returns the SSH public keys for user and host
 // certificates.
-func (h *caHandler) SSHRoots(w http.ResponseWriter, r *http.Request) {
-	keys, err := h.Authority.GetSSHRoots()
+func SSHRoots(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	keys, err := mustAuthority(ctx).GetSSHRoots(ctx)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
 
 	if len(keys.HostKeys) == 0 && len(keys.UserKeys) == 0 {
-		WriteError(w, errs.NotFound("no keys found"))
+		render.Error(w, r, errs.NotFound("no keys found"))
 		return
 	}
 
@@ -360,20 +375,21 @@ func (h *caHandler) SSHRoots(w http.ResponseWriter, r *http.Request) {
 		resp.UserKeys = append(resp.UserKeys, SSHPublicKey{PublicKey: k})
 	}
 
-	JSON(w, resp)
+	render.JSON(w, r, resp)
 }
 
 // SSHFederation is an HTTP handler that returns the federated SSH public keys
 // for user and host certificates.
-func (h *caHandler) SSHFederation(w http.ResponseWriter, r *http.Request) {
-	keys, err := h.Authority.GetSSHFederation()
+func SSHFederation(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	keys, err := mustAuthority(ctx).GetSSHFederation(ctx)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
 
 	if len(keys.HostKeys) == 0 && len(keys.UserKeys) == 0 {
-		WriteError(w, errs.NotFound("no keys found"))
+		render.Error(w, r, errs.NotFound("no keys found"))
 		return
 	}
 
@@ -385,101 +401,145 @@ func (h *caHandler) SSHFederation(w http.ResponseWriter, r *http.Request) {
 		resp.UserKeys = append(resp.UserKeys, SSHPublicKey{PublicKey: k})
 	}
 
-	JSON(w, resp)
+	render.JSON(w, r, resp)
 }
 
 // SSHConfig is an HTTP handler that returns rendered templates for ssh clients
 // and servers.
-func (h *caHandler) SSHConfig(w http.ResponseWriter, r *http.Request) {
+func SSHConfig(w http.ResponseWriter, r *http.Request) {
 	var body SSHConfigRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, r, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 	if err := body.Validate(); err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, r, err)
 		return
 	}
 
-	ts, err := h.Authority.GetSSHConfig(body.Type, body.Data)
+	ctx := r.Context()
+	ts, err := mustAuthority(ctx).GetSSHConfig(ctx, body.Type, body.Data)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
 
-	var config SSHConfigResponse
+	var cfg SSHConfigResponse
 	switch body.Type {
 	case provisioner.SSHUserCert:
-		config.UserTemplates = ts
+		cfg.UserTemplates = ts
 	case provisioner.SSHHostCert:
-		config.HostTemplates = ts
+		cfg.HostTemplates = ts
 	default:
-		WriteError(w, errs.InternalServer("it should hot get here"))
+		render.Error(w, r, errs.InternalServer("it should hot get here"))
 		return
 	}
 
-	JSON(w, config)
+	render.JSON(w, r, cfg)
 }
 
 // SSHCheckHost is the HTTP handler that returns if a hosts certificate exists or not.
-func (h *caHandler) SSHCheckHost(w http.ResponseWriter, r *http.Request) {
+func SSHCheckHost(w http.ResponseWriter, r *http.Request) {
 	var body SSHCheckPrincipalRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, r, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 	if err := body.Validate(); err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, r, err)
 		return
 	}
 
-	exists, err := h.Authority.CheckSSHHost(r.Context(), body.Principal, body.Token)
+	ctx := r.Context()
+	exists, err := mustAuthority(ctx).CheckSSHHost(ctx, body.Principal, body.Token)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
-	JSON(w, &SSHCheckPrincipalResponse{
+	render.JSON(w, r, &SSHCheckPrincipalResponse{
 		Exists: exists,
 	})
 }
 
 // SSHGetHosts is the HTTP handler that returns a list of valid ssh hosts.
-func (h *caHandler) SSHGetHosts(w http.ResponseWriter, r *http.Request) {
+func SSHGetHosts(w http.ResponseWriter, r *http.Request) {
 	var cert *x509.Certificate
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		cert = r.TLS.PeerCertificates[0]
 	}
 
-	hosts, err := h.Authority.GetSSHHosts(cert)
+	ctx := r.Context()
+	hosts, err := mustAuthority(ctx).GetSSHHosts(ctx, cert)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
-	JSON(w, &SSHGetHostsResponse{
+	render.JSON(w, r, &SSHGetHostsResponse{
 		Hosts: hosts,
 	})
 }
 
 // SSHBastion provides returns the bastion configured if any.
-func (h *caHandler) SSHBastion(w http.ResponseWriter, r *http.Request) {
+func SSHBastion(w http.ResponseWriter, r *http.Request) {
 	var body SSHBastionRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, r, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 	if err := body.Validate(); err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, r, err)
 		return
 	}
 
-	bastion, err := h.Authority.GetSSHBastion(body.User, body.Hostname)
+	ctx := r.Context()
+	bastion, err := mustAuthority(ctx).GetSSHBastion(ctx, body.User, body.Hostname)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, r, errs.InternalServerErr(err))
 		return
 	}
 
-	JSON(w, &SSHBastionResponse{
+	render.JSON(w, r, &SSHBastionResponse{
 		Hostname: body.Hostname,
 		Bastion:  bastion,
 	})
+}
+
+// identityModifier is a custom modifier used to force a fixed duration, and set
+// the identity URI.
+type identityModifier struct {
+	Identity  *url.URL
+	NotBefore time.Time
+	NotAfter  time.Time
+}
+
+// Enforce implements the enforcer interface and sets the validity bounds and
+// the identity uri to the certificate.
+func (m *identityModifier) Enforce(cert *x509.Certificate) error {
+	cert.NotBefore = m.NotBefore
+	cert.NotAfter = m.NotAfter
+	if m.Identity != nil {
+		var identityURL = m.Identity.String()
+		for _, u := range cert.URIs {
+			if u.String() == identityURL {
+				return nil
+			}
+		}
+		cert.URIs = append(cert.URIs, m.Identity)
+	}
+
+	return nil
+}
+
+// getIdentityURI returns the first valid UUID URN from the given CSR.
+func getIdentityURI(cr *x509.CertificateRequest) *url.URL {
+	for _, u := range cr.URIs {
+		s := u.String()
+		// urn:uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+		if len(s) == 9+36 && strings.EqualFold(s[:9], "urn:uuid:") {
+			if _, err := uuid.Parse(s); err == nil {
+				return u
+			}
+		}
+	}
+	return nil
 }

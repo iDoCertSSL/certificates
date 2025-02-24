@@ -4,18 +4,100 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
-	"golang.org/x/net/http2"
+	"github.com/smallstep/certificates/ca/identity"
 )
+
+// mTLSDialContext will hold the dial context function to use in
+// getDefaultTransport.
+var mTLSDialContext func() func(ctx context.Context, network, address string) (net.Conn, error)
+
+// localAddr is the local address to use when dialing an address. This address
+// is defined by the environment variable STEP_CLIENT_ADDR.
+var localAddr net.Addr
+
+func init() {
+	// STEP_TLS_TUNNEL is an environment variable that can be set to do an TLS
+	// over (m)TLS tunnel to step-ca using identity-like credentials. The value
+	// is a path to a json file with the tunnel host, certificate, key and root
+	// used to create the (m)TLS tunnel.
+	//
+	// The configuration should look like:
+	//  {
+	//      "type": "tTLS",
+	//      "host": "tunnel.example.com:443"
+	//      "crt": "/path/to/tunnel.crt",
+	//      "key": "/path/to/tunnel.key",
+	//      "root": "/path/to/tunnel-root.crt"
+	//  }
+	//
+	// This feature is EXPERIMENTAL and might change at any time.
+	if path := os.Getenv("STEP_TLS_TUNNEL"); path != "" {
+		id, err := identity.LoadIdentity(path)
+		if err != nil {
+			panic(err)
+		}
+		if err := id.Validate(); err != nil {
+			panic(err)
+		}
+		host, port, err := net.SplitHostPort(id.Host)
+		if err != nil {
+			panic(err)
+		}
+		pool, err := id.GetCertPool()
+		if err != nil {
+			panic(err)
+		}
+		mTLSDialContext = func() func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := &tls.Dialer{
+				NetDialer: createDefaultDialer(),
+				Config: &tls.Config{
+					MinVersion:           tls.VersionTLS12,
+					RootCAs:              pool,
+					GetClientCertificate: id.GetClientCertificateFunc(),
+				},
+			}
+			return func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+			}
+		}
+	}
+
+	// STEP_CLIENT_ADDR is an environment variable that can be set to define the
+	// local address to use when dialing an address. This can be useful when
+	// step is run behind a CIDR-based ACL.
+	//
+	// STEP_CLIENT_ADDR can be set to an IP ("127.0.0.1", "[::1]"), a hostname
+	// ("localhost"), or a host:port ("[::1]:0"). If the port is set to
+	// something other than ":0" and the dialer is created multiple times it
+	// will fail with an "address already in use" error.
+	//
+	// See https://github.com/smallstep/cli/issues/730
+	if v := os.Getenv("STEP_CLIENT_ADDR"); v != "" {
+		_, _, err := net.SplitHostPort(v)
+		if err != nil {
+			// assuming that the error is a missing port, if it's not it will
+			// panic below.
+			v += ":0"
+		}
+		localAddr, err = net.ResolveTCPAddr("tcp", v)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
 
 // GetClientTLSConfig returns a tls.Config for client use configured with the
 // sign certificate, and a new certificate pool with the sign root certificate.
@@ -42,7 +124,6 @@ func (c *Client) getClientTLSConfig(ctx context.Context, sign *api.SignResponse,
 	// Note that with GetClientCertificate tlsConfig.Certificates is not used.
 	// Without tlsConfig.Certificates there's not need to use tlsConfig.BuildNameToCertificate()
 	tlsConfig.GetClientCertificate = renewer.GetClientCertificate
-	tlsConfig.PreferServerCipherSuites = true
 
 	// Apply options and initialize mutable tls.Config
 	tlsCtx := newTLSOptionCtx(c, tlsConfig, sign)
@@ -50,14 +131,9 @@ func (c *Client) getClientTLSConfig(ctx context.Context, sign *api.SignResponse,
 		return nil, nil, err
 	}
 
-	// Update renew function with transport
-	tr, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Use mutable tls.Config on renew
-	tr.DialTLS = c.buildDialTLS(tlsCtx)
-	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk)
+	tr := getDefaultTransport(tlsConfig)
+	tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
+	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk) //nolint:contextcheck // deeply nested context
 
 	// Update client transport
 	c.SetTransport(tr)
@@ -87,7 +163,6 @@ func (c *Client) GetServerTLSConfig(ctx context.Context, sign *api.SignResponse,
 	// Without tlsConfig.Certificates there's not need to use tlsConfig.BuildNameToCertificate()
 	tlsConfig.GetCertificate = renewer.GetCertificate
 	tlsConfig.GetClientCertificate = renewer.GetClientCertificate
-	tlsConfig.PreferServerCipherSuites = true
 	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 
 	// Apply options and initialize mutable tls.Config
@@ -102,13 +177,9 @@ func (c *Client) GetServerTLSConfig(ctx context.Context, sign *api.SignResponse,
 	tlsConfig.GetConfigForClient = c.buildGetConfigForClient(tlsCtx)
 
 	// Update renew function with transport
-	tr, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		return nil, err
-	}
-	// Use mutable tls.Config on renew
-	tr.DialTLS = c.buildDialTLS(tlsCtx)
-	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk)
+	tr := getDefaultTransport(tlsConfig)
+	tr.DialTLSContext = c.buildDialTLSContext(tlsCtx)
+	renewer.RenewCertificate = getRenewFunc(tlsCtx, c, tr, pk) //nolint:contextcheck // deeply nested context
 
 	// Update client transport
 	c.SetTransport(tr)
@@ -139,14 +210,16 @@ func (c *Client) buildGetConfigForClient(ctx *TLSOptionCtx) func(*tls.ClientHell
 	}
 }
 
-// buildDialTLS returns an implementation of DialTLS callback in http.Transport.
-func (c *Client) buildDialTLS(ctx *TLSOptionCtx) func(network, addr string) (net.Conn, error) {
-	return func(network, addr string) (net.Conn, error) {
-		return tls.DialWithDialer(&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}, network, addr, ctx.mutableConfig.TLSConfig())
+// buildDialTLSContext returns an implementation of DialTLSContext callback in http.Transport.
+func (c *Client) buildDialTLSContext(tlsCtx *TLSOptionCtx) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := createDefaultDialer()
+		// TLS dialers do not support context, but we can use the context
+		// deadline if it is set.
+		if t, ok := ctx.Deadline(); ok {
+			d.Deadline = t
+		}
+		return tls.DialWithDialer(d, network, addr, tlsCtx.mutableConfig.TLSConfig())
 	}
 }
 
@@ -195,6 +268,7 @@ func TLSCertificate(sign *api.SignResponse, pk crypto.PrivateKey) (*tls.Certific
 		return nil, err
 	}
 
+	//nolint:gocritic // using a new variable for clarity
 	chain := append(certPEM, caPEM...)
 	cert, err := tls.X509KeyPair(chain, keyPEM)
 	if err != nil {
@@ -217,27 +291,46 @@ func getDefaultTLSConfig(sign *api.SignResponse) *tls.Config {
 	}
 }
 
+// createDefaultDialer returns a new dialer with the default configuration.
+func createDefaultDialer() *net.Dialer {
+	// With the KeepAlive parameter set to 0, it will be use Golang's default.
+	return &net.Dialer{
+		Timeout:   30 * time.Second,
+		LocalAddr: localAddr,
+	}
+}
+
 // getDefaultTransport returns an http.Transport with the same parameters than
 // http.DefaultTransport, but adds the given tls.Config and configures the
 // transport for HTTP/2.
-func getDefaultTransport(tlsConfig *tls.Config) (*http.Transport, error) {
-	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}).DialContext,
+func getDefaultTransport(tlsConfig *tls.Config) *http.Transport {
+	var dialContext func(ctx context.Context, network string, addr string) (net.Conn, error)
+	switch {
+	case runtime.GOOS == "js" && runtime.GOARCH == "wasm":
+		// when running in js/wasm and using the default dialer context all requests
+		// performed by the CA client resulted in a "protocol not supported" error.
+		// By setting the dial context to nil requests will be handled by the browser
+		// fetch API instead. Currently this will always set the dial context to nil,
+		// but we could implement some additional logic similar to what's found in
+		// https://github.com/golang/go/pull/46923/files to support a different dial
+		// context if it is available, required and expected to work.
+		dialContext = nil
+	case mTLSDialContext == nil:
+		d := createDefaultDialer()
+		dialContext = d.DialContext
+	default:
+		dialContext = mTLSDialContext()
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       tlsConfig,
 	}
-	if err := http2.ConfigureTransport(tr); err != nil {
-		return nil, errors.Wrap(err, "error configuring transport")
-	}
-	return tr, nil
 }
 
 func getPEM(i interface{}) ([]byte, error) {
@@ -256,6 +349,13 @@ func getPEM(i interface{}) ([]byte, error) {
 		var err error
 		block.Type = "EC PRIVATE KEY"
 		block.Bytes, err = x509.MarshalECPrivateKey(i)
+		if err != nil {
+			return nil, errors.Wrap(err, "error marshaling private key")
+		}
+	case ed25519.PrivateKey:
+		var err error
+		block.Type = "PRIVATE KEY"
+		block.Bytes, err = x509.MarshalPKCS8PrivateKey(i)
 		if err != nil {
 			return nil, errors.Wrap(err, "error marshaling private key")
 		}

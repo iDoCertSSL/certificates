@@ -9,20 +9,24 @@ import (
 	"os"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority"
-	"github.com/smallstep/certificates/ca"
-	"github.com/smallstep/certificates/pki"
-	"github.com/smallstep/cli/command"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/errs"
-	"github.com/smallstep/cli/ui"
-	"github.com/smallstep/cli/utils"
 	"github.com/urfave/cli"
+
+	"github.com/smallstep/cli-utils/command"
+	"github.com/smallstep/cli-utils/errs"
+	"github.com/smallstep/cli-utils/fileutil"
+	"github.com/smallstep/cli-utils/ui"
+	"go.step.sm/crypto/randutil"
+
+	"github.com/smallstep/certificates/authority/config"
+	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/cas/apiv1"
+	"github.com/smallstep/certificates/pki"
 )
 
 // defaultOnboardingURL is the production onboarding url, to use a development
 // url use:
-//   export STEP_CA_ONBOARDING_URL=http://localhost:3002/onboarding/
+//
+//	export STEP_CA_ONBOARDING_URL=http://localhost:3002/onboarding/
 const defaultOnboardingURL = "https://api.smallstep.com/onboarding/"
 
 type onboardingConfiguration struct {
@@ -90,10 +94,12 @@ func onboardAction(ctx *cli.Context) error {
 	token := ctx.Args().Get(0)
 	onboardingURL := u.ResolveReference(&url.URL{Path: token}).String()
 
+	//nolint:gosec // onboarding url
 	res, err := http.Get(onboardingURL)
 	if err != nil {
 		return errors.Wrap(err, "error connecting onboarding guide")
 	}
+	defer res.Body.Close()
 	if res.StatusCode >= 400 {
 		var msg onboardingError
 		if err := readJSON(res.Body, &msg); err != nil {
@@ -102,8 +108,8 @@ func onboardAction(ctx *cli.Context) error {
 		return errors.Wrap(msg, "error receiving onboarding guide")
 	}
 
-	var config onboardingConfiguration
-	if err := readJSON(res.Body, &config); err != nil {
+	var cfg onboardingConfiguration
+	if err := readJSON(res.Body, &cfg); err != nil {
 		return errors.Wrap(err, "error unmarshaling response")
 	}
 
@@ -111,16 +117,16 @@ func onboardAction(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	config.password = []byte(password)
+	cfg.password = []byte(password)
 
 	ui.Println("Initializing step-ca with the following configuration:")
-	ui.PrintSelected("Name", config.Name)
-	ui.PrintSelected("DNS", config.DNS)
-	ui.PrintSelected("Address", config.Address)
+	ui.PrintSelected("Name", cfg.Name)
+	ui.PrintSelected("DNS", cfg.DNS)
+	ui.PrintSelected("Address", cfg.Address)
 	ui.PrintSelected("Password", password)
 	ui.Println()
 
-	caConfig, fp, err := onboardPKI(config)
+	caConfig, fp, err := onboardPKI(cfg)
 	if err != nil {
 		return err
 	}
@@ -130,6 +136,7 @@ func onboardAction(ctx *cli.Context) error {
 		return errors.Wrap(err, "error marshaling payload")
 	}
 
+	//nolint:gosec // onboarding url
 	resp, err := http.Post(onboardingURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
 		return errors.Wrap(err, "error connecting onboarding guide")
@@ -148,44 +155,55 @@ func onboardAction(ctx *cli.Context) error {
 	ui.Println("Initialized!")
 	ui.Println("Step CA is starting. Please return to the onboarding guide in your browser to continue.")
 
-	srv, err := ca.New(caConfig, ca.WithPassword(config.password))
+	srv, err := ca.New(caConfig, ca.WithPassword(cfg.password))
 	if err != nil {
 		fatal(err)
 	}
 
 	go ca.StopReloaderHandler(srv)
-	if err = srv.Run(); err != nil && err != http.ErrServerClosed {
+	if err := srv.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal(err)
 	}
 
 	return nil
 }
 
-func onboardPKI(config onboardingConfiguration) (*authority.Config, string, error) {
-	p, err := pki.New()
+func onboardPKI(cfg onboardingConfiguration) (*config.Config, string, error) {
+	var opts = []pki.Option{
+		pki.WithAddress(cfg.Address),
+		pki.WithDNSNames([]string{cfg.DNS}),
+		pki.WithProvisioner("admin"),
+	}
+
+	p, err := pki.New(apiv1.Options{
+		Type:      apiv1.SoftCAS,
+		IsCreator: true,
+	}, opts...)
 	if err != nil {
 		return nil, "", err
 	}
 
-	p.SetAddress(config.Address)
-	p.SetDNSNames([]string{config.DNS})
-
+	// Generate pki
 	ui.Println("Generating root certificate...")
-	rootCrt, rootKey, err := p.GenerateRootCertificate(config.Name+" Root CA", config.password)
+	root, err := p.GenerateRootCertificate(cfg.Name, cfg.Name, cfg.Name, cfg.password)
 	if err != nil {
 		return nil, "", err
 	}
 
 	ui.Println("Generating intermediate certificate...")
-	err = p.GenerateIntermediateCertificate(config.Name+" Intermediate CA", rootCrt, rootKey, config.password)
+	err = p.GenerateIntermediateCertificate(cfg.Name, cfg.Name, cfg.Name, root, cfg.password)
 	if err != nil {
 		return nil, "", err
 	}
 
+	// Write files to disk
+	if err := p.WriteFiles(); err != nil {
+		return nil, "", err
+	}
+
 	// Generate provisioner
-	p.SetProvisioner("admin")
 	ui.Println("Generating admin provisioner...")
-	if err = p.GenerateKeyPairs(config.password); err != nil {
+	if err := p.GenerateKeyPairs(cfg.password); err != nil {
 		return nil, "", err
 	}
 
@@ -199,7 +217,7 @@ func onboardPKI(config onboardingConfiguration) (*authority.Config, string, erro
 	if err != nil {
 		return nil, "", errors.Wrapf(err, "error marshaling %s", p.GetCAConfigPath())
 	}
-	if err = utils.WriteFile(p.GetCAConfigPath(), b, 0666); err != nil {
+	if err := fileutil.WriteFile(p.GetCAConfigPath(), b, 0666); err != nil {
 		return nil, "", errs.FileError(err, p.GetCAConfigPath())
 	}
 

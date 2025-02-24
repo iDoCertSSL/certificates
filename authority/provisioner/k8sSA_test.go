@@ -3,14 +3,16 @@ package provisioner
 import (
 	"context"
 	"crypto/x509"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.step.sm/crypto/jose"
+
 	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"github.com/smallstep/certificates/api/render"
 )
 
 func TestK8sSA_Getters(t *testing.T) {
@@ -95,7 +97,7 @@ func TestK8sSA_authorizeToken(t *testing.T) {
 				p:     p,
 				token: tok,
 				code:  http.StatusUnauthorized,
-				err:   errors.New("k8ssa.authorizeToken; invalid k8sSA token claims: square/go-jose/jwt: validation failed, invalid issuer claim (iss)"),
+				err:   errors.New("k8ssa.authorizeToken; invalid k8sSA token claims: go-jose/go-jose/jwt: validation failed, invalid issuer claim (iss)"),
 			}
 		},
 		"ok": func(t *testing.T) test {
@@ -116,8 +118,8 @@ func TestK8sSA_authorizeToken(t *testing.T) {
 			tc := tt(t)
 			if claims, err := tc.p.authorizeToken(tc.token, testAudiences.Sign); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -165,8 +167,8 @@ func TestK8sSA_AuthorizeRevoke(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
 			if err := tc.p.AuthorizeRevoke(context.Background(), tc.token); err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tc.code)
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
@@ -179,6 +181,7 @@ func TestK8sSA_AuthorizeRevoke(t *testing.T) {
 }
 
 func TestK8sSA_AuthorizeRenew(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
 	type test struct {
 		p    *K8sSA
 		cert *x509.Certificate
@@ -192,21 +195,27 @@ func TestK8sSA_AuthorizeRenew(t *testing.T) {
 			// disable renewal
 			disable := true
 			p.Claims = &Claims{DisableRenewal: &disable}
-			p.claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
+			p.ctl.Claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
 			assert.FatalError(t, err)
 			return test{
-				p:    p,
-				cert: &x509.Certificate{},
+				p: p,
+				cert: &x509.Certificate{
+					NotBefore: now,
+					NotAfter:  now.Add(time.Hour),
+				},
 				code: http.StatusUnauthorized,
-				err:  errors.Errorf("k8ssa.AuthorizeRenew; renew is disabled for k8sSA provisioner %s", p.GetID()),
+				err:  fmt.Errorf("renew is disabled for provisioner '%s'", p.GetName()),
 			}
 		},
 		"ok": func(t *testing.T) test {
 			p, err := generateK8sSA(nil)
 			assert.FatalError(t, err)
 			return test{
-				p:    p,
-				cert: &x509.Certificate{},
+				p: p,
+				cert: &x509.Certificate{
+					NotBefore: now,
+					NotAfter:  now.Add(time.Hour),
+				},
 			}
 		},
 	}
@@ -214,8 +223,8 @@ func TestK8sSA_AuthorizeRenew(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
 			if err := tc.p.AuthorizeRenew(context.Background(), tc.cert); err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tc.code)
 				if assert.NotNil(t, tc.err) {
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
@@ -263,34 +272,38 @@ func TestK8sSA_AuthorizeSign(t *testing.T) {
 			tc := tt(t)
 			if opts, err := tc.p.AuthorizeSign(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
-						tot := 0
 						for _, o := range opts {
 							switch v := o.(type) {
+							case *K8sSA:
+							case certificateOptionsFunc:
 							case *provisionerExtensionOption:
-								assert.Equals(t, v.Type, int(TypeK8sSA))
+								assert.Equals(t, v.Type, TypeK8sSA)
 								assert.Equals(t, v.Name, tc.p.GetName())
 								assert.Equals(t, v.CredentialID, "")
 								assert.Len(t, 0, v.KeyValuePairs)
 							case profileDefaultDuration:
-								assert.Equals(t, time.Duration(v), tc.p.claimer.DefaultTLSCertDuration())
+								assert.Equals(t, time.Duration(v), tc.p.ctl.Claimer.DefaultTLSCertDuration())
 							case defaultPublicKeyValidator:
 							case *validityValidator:
-								assert.Equals(t, v.min, tc.p.claimer.MinTLSCertDuration())
-								assert.Equals(t, v.max, tc.p.claimer.MaxTLSCertDuration())
+								assert.Equals(t, v.min, tc.p.ctl.Claimer.MinTLSCertDuration())
+								assert.Equals(t, v.max, tc.p.ctl.Claimer.MaxTLSCertDuration())
+							case *x509NamePolicyValidator:
+								assert.Equals(t, nil, v.policyEngine)
+							case *WebhookController:
+								assert.Len(t, 0, v.webhooks)
 							default:
-								assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+								assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 							}
-							tot++
 						}
-						assert.Equals(t, tot, 4)
+						assert.Equals(t, 8, len(opts))
 					}
 				}
 			}
@@ -312,13 +325,13 @@ func TestK8sSA_AuthorizeSSHSign(t *testing.T) {
 			// disable sshCA
 			disable := false
 			p.Claims = &Claims{EnableSSHCA: &disable}
-			p.claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
+			p.ctl.Claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
 			assert.FatalError(t, err)
 			return test{
 				p:     p,
 				token: "foo",
 				code:  http.StatusUnauthorized,
-				err:   errors.Errorf("k8ssa.AuthorizeSSHSign; sshCA is disabled for k8sSA provisioner %s", p.GetID()),
+				err:   fmt.Errorf("k8ssa.AuthorizeSSHSign; sshCA is disabled for k8sSA provisioner '%s'", p.GetName()),
 			}
 		},
 		"fail/invalid-token": func(t *testing.T) test {
@@ -349,32 +362,36 @@ func TestK8sSA_AuthorizeSSHSign(t *testing.T) {
 			tc := tt(t)
 			if opts, err := tc.p.AuthorizeSSHSign(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
-						tot := 0
+						assert.Len(t, 9, opts)
 						for _, o := range opts {
 							switch v := o.(type) {
-							case sshCertDefaultsModifier:
-								assert.Equals(t, v.CertType, SSHUserCert)
-							case *sshDefaultExtensionModifier:
+							case Interface:
+							case sshCertificateOptionsFunc:
+							case *sshCertOptionsRequireValidator:
+								assert.Equals(t, v, &sshCertOptionsRequireValidator{CertType: true, KeyID: true, Principals: true})
 							case *sshCertValidityValidator:
-								assert.Equals(t, v.Claimer, tc.p.claimer)
+								assert.Equals(t, v.Claimer, tc.p.ctl.Claimer)
 							case *sshDefaultPublicKeyValidator:
 							case *sshCertDefaultValidator:
 							case *sshDefaultDuration:
-								assert.Equals(t, v.Claimer, tc.p.claimer)
+								assert.Equals(t, v.Claimer, tc.p.ctl.Claimer)
+							case *sshNamePolicyValidator:
+								assert.Equals(t, nil, v.userPolicyEngine)
+								assert.Equals(t, nil, v.hostPolicyEngine)
+							case *WebhookController:
+								assert.Len(t, 0, v.webhooks)
 							default:
-								assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+								assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 							}
-							tot++
 						}
-						assert.Equals(t, tot, 6)
 					}
 				}
 			}

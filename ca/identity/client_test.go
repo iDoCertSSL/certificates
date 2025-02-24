@@ -3,13 +3,22 @@ package identity
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
+	"sort"
 	"testing"
+
+	"github.com/smallstep/certificates/internal/httptransport"
 )
+
+func returnInput(val string) func() string {
+	return func() string {
+		return val
+	}
+}
 
 func TestClient(t *testing.T) {
 	oldIdentityFile := IdentityFile
@@ -19,8 +28,8 @@ func TestClient(t *testing.T) {
 		DefaultsFile = oldDefaultsFile
 	}()
 
-	IdentityFile = "testdata/config/identity.json"
-	DefaultsFile = "testdata/config/defaults.json"
+	IdentityFile = returnInput("testdata/config/identity.json")
+	DefaultsFile = returnInput("testdata/config/defaults.json")
 
 	client, err := LoadClient()
 	if err != nil {
@@ -40,7 +49,7 @@ func TestClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := ioutil.ReadFile("testdata/certs/root_ca.crt")
+	b, err := os.ReadFile("testdata/certs/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +60,7 @@ func TestClient(t *testing.T) {
 		Certificates: []tls.Certificate{crt},
 		ClientCAs:    pool,
 		ClientAuth:   tls.VerifyClientCertIfGiven,
+		MinVersion:   tls.VersionTLS12,
 	}
 	okServer.StartTLS()
 
@@ -114,17 +124,18 @@ func TestLoadClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := ioutil.ReadFile("testdata/certs/root_ca.crt")
+	b, err := os.ReadFile("testdata/certs/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(b)
 
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := httptransport.New()
 	tr.TLSClientConfig = &tls.Config{
 		Certificates: []tls.Certificate{crt},
 		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
 	}
 	expected := &Client{
 		CaURL: &url.URL{Scheme: "https", Host: "127.0.0.1"},
@@ -140,36 +151,36 @@ func TestLoadClient(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", func() {
-			IdentityFile = "testdata/config/identity.json"
-			DefaultsFile = "testdata/config/defaults.json"
+			IdentityFile = returnInput("testdata/config/identity.json")
+			DefaultsFile = returnInput("testdata/config/defaults.json")
 		}, expected, false},
 		{"fail identity", func() {
-			IdentityFile = "testdata/config/missing.json"
-			DefaultsFile = "testdata/config/defaults.json"
+			IdentityFile = returnInput("testdata/config/missing.json")
+			DefaultsFile = returnInput("testdata/config/defaults.json")
 		}, nil, true},
 		{"fail identity", func() {
-			IdentityFile = "testdata/config/fail.json"
-			DefaultsFile = "testdata/config/defaults.json"
+			IdentityFile = returnInput("testdata/config/fail.json")
+			DefaultsFile = returnInput("testdata/config/defaults.json")
 		}, nil, true},
 		{"fail defaults", func() {
-			IdentityFile = "testdata/config/identity.json"
-			DefaultsFile = "testdata/config/missing.json"
+			IdentityFile = returnInput("testdata/config/identity.json")
+			DefaultsFile = returnInput("testdata/config/missing.json")
 		}, nil, true},
 		{"fail defaults", func() {
-			IdentityFile = "testdata/config/identity.json"
-			DefaultsFile = "testdata/config/fail.json"
+			IdentityFile = returnInput("testdata/config/identity.json")
+			DefaultsFile = returnInput("testdata/config/fail.json")
 		}, nil, true},
 		{"fail ca", func() {
-			IdentityFile = "testdata/config/identity.json"
-			DefaultsFile = "testdata/config/badca.json"
+			IdentityFile = returnInput("testdata/config/identity.json")
+			DefaultsFile = returnInput("testdata/config/badca.json")
 		}, nil, true},
 		{"fail root", func() {
-			IdentityFile = "testdata/config/identity.json"
-			DefaultsFile = "testdata/config/badroot.json"
+			IdentityFile = returnInput("testdata/config/identity.json")
+			DefaultsFile = returnInput("testdata/config/badroot.json")
 		}, nil, true},
 		{"fail type", func() {
-			IdentityFile = "testdata/config/badIdentity.json"
-			DefaultsFile = "testdata/config/defaults.json"
+			IdentityFile = returnInput("testdata/config/badIdentity.json")
+			DefaultsFile = returnInput("testdata/config/defaults.json")
 		}, nil, true},
 	}
 	for _, tt := range tests {
@@ -185,11 +196,22 @@ func TestLoadClient(t *testing.T) {
 					t.Errorf("LoadClient() = %#v, want %#v", got, tt.want)
 				}
 			} else {
-				if !reflect.DeepEqual(got.CaURL, tt.want.CaURL) ||
-					!reflect.DeepEqual(got.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, tt.want.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs) ||
-					!reflect.DeepEqual(got.Client.Transport.(*http.Transport).TLSClientConfig.Certificates, tt.want.Client.Transport.(*http.Transport).TLSClientConfig.Certificates) {
+				gotTransport := got.Client.Transport.(*http.Transport)
+				wantTransport := tt.want.Client.Transport.(*http.Transport)
+				switch {
+				case gotTransport.TLSClientConfig.GetClientCertificate == nil:
+					t.Error("LoadClient() transport does not define GetClientCertificate")
+				case !reflect.DeepEqual(got.CaURL, tt.want.CaURL) || !equalPools(gotTransport.TLSClientConfig.RootCAs, wantTransport.TLSClientConfig.RootCAs):
 					t.Errorf("LoadClient() = %#v, want %#v", got, tt.want)
+				default:
+					crt, err := gotTransport.TLSClientConfig.GetClientCertificate(nil)
+					if err != nil {
+						t.Errorf("LoadClient() GetClientCertificate error = %v", err)
+					} else if !reflect.DeepEqual(*crt, wantTransport.TLSClientConfig.Certificates[0]) {
+						t.Errorf("LoadClient() GetClientCertificate crt = %#v, want %#v", *crt, wantTransport.TLSClientConfig.Certificates[0])
+					}
 				}
+
 			}
 		})
 	}
@@ -220,4 +242,24 @@ func Test_defaultsConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+//nolint:staticcheck,gocritic
+func equalPools(a, b *x509.CertPool) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	subjects := a.Subjects()
+	sA := make([]string, len(subjects))
+	for i := range subjects {
+		sA[i] = string(subjects[i])
+	}
+	subjects = b.Subjects()
+	sB := make([]string, len(subjects))
+	for i := range subjects {
+		sB[i] = string(subjects[i])
+	}
+	sort.Strings(sA)
+	sort.Strings(sB)
+	return reflect.DeepEqual(sA, sB)
 }
